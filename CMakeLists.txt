@@ -6,3 +6,5 @@ add_subdirectory(drivers/lhal)
 add_subdirectory(drivers/soc/${CHIP}/std)
 sdk_add_subdirectory_ifdef(CONFIG_RF drivers/soc/${CHIP}/rf)
 sdk_add_subdirectory_ifdef(CONFIG_RF drivers/rfparam)
+
+add_subdirectory(sipeed/libs)
