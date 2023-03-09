@@ -6,15 +6,17 @@
 #define DBG_TAG "MAIN"
 #include "log.h"
 
-#include "usbd_core.h"
+#include "csi_core.h"
 #include "bflb_gpio.h"
 #include "bflb_uart.h"
+#include "usbd_core.h"
+#include "usbd_cdc.h"
 #include "ring_buffer.h"
-#include "csi_core.h"
 
 #include "cfg.h"
 
 Ring_Buffer_Type uart1_rx_rb;
+static volatile struct cdc_line_coding s_cdc_line_coding;
 
 static struct bflb_device_s *gpio;
 static struct bflb_device_s *uart1;
@@ -119,17 +121,42 @@ static void uart1_init(void)
 {
     uart1 = bflb_device_get_by_name("uart1");
 
-    struct bflb_uart_config_s cfg;
-    cfg.baudrate = 2000000;
-    cfg.data_bits = UART_DATA_BITS_8;
-    cfg.stop_bits = UART_STOP_BITS_1;
-    cfg.parity = UART_PARITY_NONE;
-    cfg.flow_ctrl = 0;
-    cfg.tx_fifo_threshold = 7;
-    cfg.rx_fifo_threshold = 0;
-    bflb_uart_init(uart1, &cfg);
+    s_cdc_line_coding.dwDTERate = 2000000;
+    s_cdc_line_coding.bDataBits = 8;
+    s_cdc_line_coding.bParityType = 0;
+    s_cdc_line_coding.bCharFormat = 0;
+
+    bflb_uart_init(
+        uart1,
+        &(struct bflb_uart_config_s){
+            .baudrate = (s_cdc_line_coding.dwDTERate),
+            .data_bits = UART_DATA_BITS_5 + (s_cdc_line_coding.bDataBits - 5),
+            .stop_bits = UART_STOP_BITS_0_5 + (s_cdc_line_coding.bCharFormat + 1),
+            .parity = UART_PARITY_NONE + (s_cdc_line_coding.bParityType),
+            .flow_ctrl = 0,
+            .tx_fifo_threshold = 7,
+            .rx_fifo_threshold = 0,
+        });
 
     bflb_irq_attach(uart1->irq_num, uart_isr, NULL);
     bflb_irq_enable(uart1->irq_num);
     bflb_uart_rxint_mask(uart1, false);
+}
+
+void usbd_cdc_acm_set_line_coding(uint8_t intf, struct cdc_line_coding *line_coding)
+{
+    LOG_D("intf: %u\r\n", intf);
+    memcpy((void *)&s_cdc_line_coding, line_coding, sizeof(struct cdc_line_coding));
+    bflb_uart_disable(uart1);
+    bflb_uart_feature_control(uart1, UART_CMD_SET_BAUD_RATE, (s_cdc_line_coding.dwDTERate));
+    bflb_uart_feature_control(uart1, UART_CMD_SET_DATA_BITS, (s_cdc_line_coding.bDataBits - 5));
+    bflb_uart_feature_control(uart1, UART_CMD_SET_STOP_BITS, (s_cdc_line_coding.bCharFormat + 1));
+    bflb_uart_feature_control(uart1, UART_CMD_SET_PARITY_BITS, (s_cdc_line_coding.bParityType));
+    bflb_uart_enable(uart1);
+}
+
+void usbd_cdc_acm_get_line_coding(uint8_t intf, struct cdc_line_coding *line_coding)
+{
+    LOG_D("intf: %u\r\n", intf);
+    memcpy(line_coding, (void *)&s_cdc_line_coding, sizeof(struct cdc_line_coding));
 }
