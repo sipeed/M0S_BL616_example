@@ -208,7 +208,7 @@ void board_init(void)
 
     flag = bflb_irq_save();
 
-    ret = bflb_flash_init();
+    // ret = bflb_flash_init();
 
     system_clock_init();
     peripheral_clock_init();
