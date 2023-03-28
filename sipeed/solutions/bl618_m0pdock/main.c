@@ -39,7 +39,7 @@
 /* lvgl log cb */
 void lv_log_print_g_cb(const char *buf)
 {
-    printf("[LVGL] %s", buf);
+    printf("[LVGL] %s\r\n", buf);
 }
 
 int main(void)
@@ -55,7 +55,7 @@ int main(void)
     lv_log_register_print_cb(lv_log_print_g_cb);
     lv_init();
     lv_port_disp_init();
-    // lv_port_indev_init();
+    lv_port_indev_init();
 
     lv_demo_widgets();
 

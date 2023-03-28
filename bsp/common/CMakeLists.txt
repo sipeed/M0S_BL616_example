@@ -47,6 +47,7 @@ if(CONFIG_BSP_TOUCH)
 target_sources(app PRIVATE touch/touch.c)
 target_sources(app PRIVATE touch/ft6x36_i2c.c)
 target_sources(app PRIVATE touch/gt911_i2c.c)
+target_sources(app PRIVATE touch/gsl2038_i2c.c)
 sdk_add_include_directories(touch)
 endif()
 
