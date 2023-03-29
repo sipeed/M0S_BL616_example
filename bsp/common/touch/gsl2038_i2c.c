@@ -5149,19 +5149,23 @@ int gsl2038_i2c_read(uint8_t *point_num, touch_coord_t *touch_coord, uint8_t max
     for (uint8_t i = 0; i < read_num; i++) {
         uint8_t *p_data = &data_buf[i * 4];
         uint8_t finger_id = p_data[3] >> 4;
-        touch_coord[i].coord_x = ((uint16_t)p_data[1] << 8 | p_data[0]) & 0x0FFF; // 12 bits of X coord
-        touch_coord[i].coord_y = ((uint16_t)p_data[3] << 8 | p_data[2]) & 0x0FFF;
+        uint16_t coord_x = ((uint16_t)p_data[1] << 8 | p_data[0]) & 0x0FFF; // 12 bits of X coord
+        uint16_t coord_y = ((uint16_t)p_data[3] << 8 | p_data[2]) & 0x0FFF;
+
+        int32_t A = 21132, B = 1469, C = -1019138, D = 23, E = 33170, F = -1665966;
+        int32_t cal_x = (A * coord_x + B * coord_y + C);
+        int32_t cal_y = (D * coord_x + E * coord_y + F);
+        if (cal_x < 0)
+            cal_x = 0;
+        if (cal_y < 0)
+            cal_y = 0;
+
+        touch_coord[i].coord_x = (uint16_t)(cal_x >> 16);
+        touch_coord[i].coord_y = (uint16_t)(cal_y >> 16);
+
         // printf("[%u](%u, %u)\r\n", finger_id, touch_coord[i].coord_x, touch_coord[i].coord_y);
-        // 3x44 1020x664
-        touch_coord[i].coord_x -= 3;
-        touch_coord[i].coord_y -= 44;
-        touch_coord[i].coord_x = (uint16_t)(((float)touch_coord[i].coord_x) * 320 / (1020 - 3));
-        touch_coord[i].coord_y = (uint16_t)(((float)touch_coord[i].coord_y) * 320 / (664 - 44));
-        if (touch_coord[i].coord_x > 320)
-            touch_coord[i].coord_x = 320;
-        if (touch_coord[i].coord_y > 320)
-            touch_coord[i].coord_y = 320;
     }
+    // printf("\r\n");
 
     *point_num = read_num;
 
