@@ -42,6 +42,9 @@
 #include "csi_rv32_gcc.h"
 #include "image_sensor.h"
 
+#define DBG_TAG "main"
+#include "log.h"
+
 static struct bflb_device_s *cam0;
 static struct bflb_device_s *adc;
 
@@ -105,7 +108,7 @@ int main(void)
     bflb_gpio_init(gpio, GPIO_PIN_34, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
     cam_init();
 
-    printf("lvgl success\r\n");
+    LOG_I("lvgl success\r\n");
 
     while (1) {
         lv_task_handler();
@@ -125,9 +128,9 @@ static void cam_init(void)
     cam0 = bflb_device_get_by_name("cam0");
 
     if (image_sensor_scan(i2c0, &sensor_config)) {
-        printf("\r\nSensor name: %s\r\n", sensor_config->name);
+        LOG_I("\r\nSensor name: %s\r\n", sensor_config->name);
     } else {
-        printf("\r\nError! Can't identify sensor!\r\n");
+        LOG_E("\r\nError! Can't identify sensor!\r\n");
         cam0 = NULL;
         return;
     }
@@ -217,9 +220,9 @@ static void adc_init(void)
     bflb_dma_channel_lli_link_head(dma0_ch0, lli, used_count);
     bflb_dma_channel_start(dma0_ch0);
 
-    bflb_adc_start_conversion(adc);
+    // bflb_adc_start_conversion(adc);
 
-    // bflb_adc_stop_conversion(adc);
+    bflb_adc_stop_conversion(adc);
 }
 
 static void cam_isr(int irq, void *arg)
@@ -277,7 +280,7 @@ void btn_cam_event_handled(lv_event_t *e)
     if (code == LV_EVENT_VALUE_CHANGED) {
         // LV_LOG_USER("%s checked %u", label->text, is_btn_checked);
         if (cam0) {
-            (void (*[])(struct bflb_device_s *)){ bflb_cam_stop, bflb_cam_start }[!is_btn_checked](cam0);
+            (void (*[])(struct bflb_device_s *)){ bflb_cam_stop, bflb_cam_start }[is_btn_checked](cam0);
         }
     }
 }
@@ -294,7 +297,7 @@ void btn_adc_event_handled(lv_event_t *e)
     if (code == LV_EVENT_VALUE_CHANGED) {
         // LV_LOG_USER("%s checked %u", label->text, is_btn_checked);
         if (adc) {
-            (void (*[])(struct bflb_device_s *)){ bflb_adc_stop_conversion, bflb_adc_start_conversion }[!is_btn_checked](adc);
+            (void (*[])(struct bflb_device_s *)){ bflb_adc_stop_conversion, bflb_adc_start_conversion }[is_btn_checked](adc);
         }
     }
 }

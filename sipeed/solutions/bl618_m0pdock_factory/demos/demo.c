@@ -21,6 +21,7 @@ void demo(void)
     lv_obj_t *btn, *label;
     btn = lv_btn_create(chart_mic);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_add_state(btn, LV_STATE_CHECKED);
     lv_obj_set_height(btn, LV_SIZE_CONTENT);
     label = lv_label_create(btn);
     lv_obj_center(label);
