@@ -16,16 +16,45 @@ void demo(void)
 {
     canvas_cam = canvas_cam_create(lv_scr_act());
     chart_mic = chart_mic_create(lv_scr_act());
-    label_adc_btn = label_adc_btn_create(canvas_cam);
+    label_adc_btn = label_adc_btn_create(chart_mic);
+
+    lv_obj_t *btn, *label;
+    btn = lv_btn_create(chart_mic);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_set_height(btn, LV_SIZE_CONTENT);
+    label = lv_label_create(btn);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, btn_cam_event_handled, LV_EVENT_ALL, NULL);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, -10, 0);
+    lv_label_set_text(label, "CAM");
+
+    btn = lv_btn_create(chart_mic);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_set_height(btn, LV_SIZE_CONTENT);
+    label = lv_label_create(btn);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, btn_adc_event_handled, LV_EVENT_ALL, NULL);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, 60, 0);
+    lv_label_set_text(label, "ADC");
 
     lv_obj_t *led;
-    led = lv_led_create(canvas_cam);
+    led = lv_led_create(lv_obj_get_parent(label_adc_btn));
     led_adc_btn[0] = led;
     lv_obj_align(led, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    led = lv_led_create(canvas_cam);
+    led = lv_led_create(lv_obj_get_parent(label_adc_btn));
     led_adc_btn[1] = led;
     lv_obj_align(led, LV_ALIGN_TOP_RIGHT, 0, 0);
+}
+
+void canvas_cam_update(void *pic_addr)
+{
+    if (!canvas_cam) {
+        return;
+    }
+
+    lv_obj_t *canvas = canvas_cam;
+    lv_canvas_set_buffer(canvas, pic_addr, 320, 240, LV_IMG_CF_TRUE_COLOR);
 }
 
 void chart_mic_append_data(int16_t *data, uint16_t len)
@@ -40,14 +69,8 @@ void chart_mic_append_data(int16_t *data, uint16_t len)
     lv_obj_t *chart = chart_mic;
     lv_chart_set_point_count(chart, 0);
 
-    // memcpy(ecg_sample, ecg_sample + len, (pcnt - len) * sizeof(lv_coord_t));
-    // memcpy(ecg_sample + pcnt - len, data, len * sizeof(lv_coord_t));
-    for (uint32_t i = 0; i < pcnt - len; i++) {
-        ecg_sample[i] = ecg_sample[i + len];
-    }
-    for (uint32_t i = 0; i < len; i++) {
-        ecg_sample[pcnt - len + i] = data[i];
-    }
+    memcpy(ecg_sample, ecg_sample + len, (pcnt - len) * sizeof(lv_coord_t));
+    memcpy(ecg_sample + pcnt - len, data, len * sizeof(lv_coord_t));
 
     lv_chart_set_point_count(chart, pcnt);
 }
@@ -83,7 +106,7 @@ void label_adc_btn_update(uint16_t val)
 static lv_obj_t *canvas_cam_create(lv_obj_t *parent)
 {
     lv_obj_t *canvas;
-    canvas = lv_obj_create(parent);
+    canvas = lv_canvas_create(parent);
     lv_obj_set_size(canvas, 320, 240);
     lv_obj_align(canvas, LV_ALIGN_TOP_MID, 0, 0);
 

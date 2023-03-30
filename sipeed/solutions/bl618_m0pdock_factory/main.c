@@ -40,16 +40,18 @@
 #include "bflb_cam.h"
 #include "bflb_dma.h"
 #include "csi_rv32_gcc.h"
+#include "image_sensor.h"
 
 static struct bflb_device_s *cam0;
 static struct bflb_device_s *adc;
 
+static void cam_init(void);
 static void adc_init(void);
 
 /* lvgl log cb */
 static void lv_log_print_g_cb(const char *buf)
 {
-    printf("[LVGL] %s\r\n", buf);
+    // printf("[LVGL] %s\r\n", buf);
 }
 
 int main(void)
@@ -62,13 +64,6 @@ int main(void)
     bflb_gpio_init(gpio, GPIO_PIN_2, GPIO_OUTPUT | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_0);
     bflb_gpio_set(gpio, GPIO_PIN_2);
 
-    /* ADC_CH0 */
-    bflb_gpio_init(gpio, GPIO_PIN_20, GPIO_ANALOG | GPIO_SMT_EN | GPIO_DRV_0);
-    /* ADC_CH3 */
-    bflb_gpio_init(gpio, GPIO_PIN_3, GPIO_ANALOG | GPIO_SMT_EN | GPIO_DRV_0);
-    /* adc init */
-    adc_init();
-
     /* lvgl init */
     lv_log_register_print_cb(lv_log_print_g_cb);
     lv_init();
@@ -77,12 +72,81 @@ int main(void)
 
     demo();
 
+    /* ADC_CH0 */
+    bflb_gpio_init(gpio, GPIO_PIN_20, GPIO_ANALOG | GPIO_SMT_EN | GPIO_DRV_0);
+    /* ADC_CH3 */
+    bflb_gpio_init(gpio, GPIO_PIN_3, GPIO_ANALOG | GPIO_SMT_EN | GPIO_DRV_0);
+    /* adc init */
+    adc_init();
+
+    /* DVP0 GPIO init */
+    /* I2C GPIO */
+    // bflb_gpio_init(gpio, GPIO_PIN_0, GPIO_FUNC_I2C0 | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    // bflb_gpio_init(gpio, GPIO_PIN_1, GPIO_FUNC_I2C0 | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+
+    /* Power down GPIO */
+    bflb_gpio_init(gpio, GPIO_PIN_16, GPIO_OUTPUT | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_reset(gpio, GPIO_PIN_16);
+
+    /* MCLK GPIO */
+    bflb_gpio_init(gpio, GPIO_PIN_6, GPIO_FUNC_CLKOUT | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+
+    /* DVP0 GPIO */
+    bflb_gpio_init(gpio, GPIO_PIN_24, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_25, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_26, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_27, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_28, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_29, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_30, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_31, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_32, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_33, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    bflb_gpio_init(gpio, GPIO_PIN_34, GPIO_FUNC_CAM | GPIO_ALTERNATE | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_1);
+    cam_init();
+
     printf("lvgl success\r\n");
 
     while (1) {
         lv_task_handler();
         bflb_mtimer_delay_ms(1);
     }
+}
+
+static void cam_isr(int irq, void *arg);
+
+static void cam_init(void)
+{
+    struct bflb_cam_config_s cam_config;
+    struct image_sensor_config_s *sensor_config;
+    struct bflb_device_s *i2c0;
+
+    i2c0 = bflb_device_get_by_name("i2c0");
+    cam0 = bflb_device_get_by_name("cam0");
+
+    if (image_sensor_scan(i2c0, &sensor_config)) {
+        printf("\r\nSensor name: %s\r\n", sensor_config->name);
+    } else {
+        printf("\r\nError! Can't identify sensor!\r\n");
+        cam0 = NULL;
+        return;
+    }
+
+    bflb_cam_int_mask(cam0, CAM_INTMASK_NORMAL, false);
+    bflb_irq_attach(cam0->irq_num, cam_isr, NULL);
+    bflb_irq_enable(cam0->irq_num);
+
+    memcpy(&cam_config, sensor_config, IMAGE_SENSOR_INFO_COPY_SIZE);
+    cam_config.with_mjpeg = false;
+    cam_config.output_format = CAM_OUTPUT_FORMAT_AUTO;
+    static lv_color_t cam_buffer[4][320 * 240] __section(".psmram_data");
+    cam_config.output_bufaddr = (uint32_t)(uintptr_t)(void *)cam_buffer;
+    cam_config.output_bufsize = sizeof(cam_buffer);
+
+    bflb_cam_init(cam0, &cam_config);
+    bflb_cam_start(cam0);
+
+    // bflb_cam_stop(cam0);
 }
 
 #define UPDATE_FREQ       2
@@ -158,6 +222,22 @@ static void adc_init(void)
     // bflb_adc_stop_conversion(adc);
 }
 
+static void cam_isr(int irq, void *arg)
+{
+    uint16_t *pic_addr;
+    uint32_t pic_size;
+    // static volatile uint32_t cam_int_cnt = 0;
+
+    bflb_cam_int_clear(cam0, CAM_INTCLR_NORMAL);
+    pic_size = bflb_cam_get_frame_info(cam0, (void *)&pic_addr);
+    bflb_cam_pop_one_frame(cam0);
+    // printf("CAM interrupt, pop picture %d: 0x%08x, len: %d\r\n", cam_int_cnt++, (uint32_t)pic_addr, pic_size);
+    for (size_t i = 0; i < pic_size / sizeof(uint16_t); i++) {
+        pic_addr[i] = __bswap16(pic_addr[i]);
+    }
+    canvas_cam_update(pic_addr);
+}
+
 static void dma0_ch0_isr(void *arg)
 {
     static uint32_t dma_tc_flag0 = 0;
@@ -183,4 +263,38 @@ static void dma0_ch0_isr(void *arg)
 
     chart_mic_append_data(results_temp, TEST_COUNT);
     label_adc_btn_update(btn_adc_val_avg);
+}
+
+void btn_cam_event_handled(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    lv_obj_t *btn = e->target;
+    lv_label_t *label = (lv_label_t *)lv_obj_get_child(btn, 0);
+
+    bool is_btn_checked = (lv_obj_get_state(btn) & LV_STATE_CHECKED);
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        // LV_LOG_USER("%s checked %u", label->text, is_btn_checked);
+        if (cam0) {
+            (void (*[])(struct bflb_device_s *)){ bflb_cam_stop, bflb_cam_start }[!is_btn_checked](cam0);
+        }
+    }
+}
+
+void btn_adc_event_handled(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    lv_obj_t *btn = e->target;
+    lv_label_t *label = (lv_label_t *)lv_obj_get_child(btn, 0);
+
+    bool is_btn_checked = (lv_obj_get_state(btn) & LV_STATE_CHECKED);
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        // LV_LOG_USER("%s checked %u", label->text, is_btn_checked);
+        if (adc) {
+            (void (*[])(struct bflb_device_s *)){ bflb_adc_stop_conversion, bflb_adc_start_conversion }[!is_btn_checked](adc);
+        }
+    }
 }
