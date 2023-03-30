@@ -2,50 +2,30 @@
 
 static lv_obj_t *canvas_cam;
 static lv_obj_t *chart_mic;
+static lv_obj_t *label_tfcard;
 static lv_obj_t *label_adc_btn;
 static lv_obj_t *led_adc_btn[2];
 
+static bool label_tfcard_state;
 static lv_coord_t ecg_sample[160];
-static uint16_t label_adc_btn_val;
 
 static lv_obj_t *canvas_cam_create(lv_obj_t *parent);
 static lv_obj_t *chart_mic_create(lv_obj_t *parent);
-static lv_obj_t *label_adc_btn_create(lv_obj_t *parent);
+static lv_obj_t *label_btns_leds_create(lv_obj_t *parent);
 
 void demo(void)
 {
     canvas_cam = canvas_cam_create(lv_scr_act());
     chart_mic = chart_mic_create(lv_scr_act());
-    label_adc_btn = label_adc_btn_create(chart_mic);
+    label_tfcard = label_btns_leds_create(chart_mic);
 
-    lv_obj_t *btn, *label;
-    btn = lv_btn_create(chart_mic);
-    lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
-    lv_obj_add_state(btn, LV_STATE_CHECKED);
-    lv_obj_set_height(btn, LV_SIZE_CONTENT);
-    label = lv_label_create(btn);
-    lv_obj_center(label);
-    lv_obj_add_event_cb(btn, btn_cam_event_handled, LV_EVENT_ALL, NULL);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, -10, 0);
-    lv_label_set_text(label, "CAM");
-
-    btn = lv_btn_create(chart_mic);
-    lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
-    lv_obj_set_height(btn, LV_SIZE_CONTENT);
-    label = lv_label_create(btn);
-    lv_obj_center(label);
-    lv_obj_add_event_cb(btn, btn_adc_event_handled, LV_EVENT_ALL, NULL);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, 60, 0);
-    lv_label_set_text(label, "ADC");
-
-    lv_obj_t *led;
-    led = lv_led_create(lv_obj_get_parent(label_adc_btn));
-    led_adc_btn[0] = led;
-    lv_obj_align(led, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    led = lv_led_create(lv_obj_get_parent(label_adc_btn));
-    led_adc_btn[1] = led;
-    lv_obj_align(led, LV_ALIGN_TOP_RIGHT, 0, 0);
+    if (label_tfcard_state) {
+        lv_label_set_text(label_tfcard, "TFCard Plugged!");
+        lv_obj_set_style_text_color(label_tfcard, lv_color_make(0x00, 0x00, 0xff), 0);
+    } else {
+        lv_label_set_text(label_tfcard, "TFCard not found!");
+        lv_obj_set_style_text_color(label_tfcard, lv_color_make(0xff, 0x00, 0x00), 0);
+    }
 }
 
 void canvas_cam_update(void *pic_addr)
@@ -76,14 +56,20 @@ void chart_mic_append_data(int16_t *data, uint16_t len)
     lv_chart_set_point_count(chart, pcnt);
 }
 
+void label_tfcard_state_update(bool en)
+{
+    label_tfcard_state = en;
+}
+
 void label_adc_btn_update(uint16_t val)
 {
     if (!label_adc_btn) {
         return;
     }
 
-    label_adc_btn_val = val;
-    lv_label_set_text_fmt(label_adc_btn, "%-4u mv", label_adc_btn_val);
+    if ((lv_obj_get_state(lv_obj_get_parent(label_adc_btn)) & LV_STATE_CHECKED)) {
+        lv_label_set_text_fmt(label_adc_btn, "%-4u mv", val);
+    }
 
     bool btn_clicked[2];
 
@@ -139,15 +125,43 @@ static lv_obj_t *chart_mic_create(lv_obj_t *parent)
     return chart;
 }
 
-static lv_obj_t *label_adc_btn_create(lv_obj_t *parent)
+static lv_obj_t *label_btns_leds_create(lv_obj_t *parent)
 {
     lv_obj_t *label;
-    label = lv_label_create(parent);
 
-    lv_obj_set_width(label, 100);
+    lv_obj_t *btn;
+    btn = lv_btn_create(parent);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_add_state(btn, LV_STATE_CHECKED);
+    lv_obj_set_height(btn, LV_SIZE_CONTENT);
+    label = lv_label_create(btn);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, btn_cam_event_handled, LV_EVENT_ALL, NULL);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, -10, 0);
+    lv_label_set_text(label, "CAM");
+
+    btn = lv_btn_create(parent);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_set_height(btn, LV_SIZE_CONTENT);
+    label = lv_label_create(btn);
+    label_adc_btn = label;
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, btn_adc_event_handled, LV_EVENT_ALL, NULL);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, 60, 0);
+    lv_label_set_text(label, "ADC");
+
+    lv_obj_t *led;
+    led = lv_led_create(parent);
+    led_adc_btn[0] = led;
+    lv_obj_align(led, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    led = lv_led_create(parent);
+    led_adc_btn[1] = led;
+    lv_obj_align(led, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+    label = lv_label_create(parent);
     lv_obj_align_to(label, parent, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_style_text_color(label, lv_color_make(0xff, 0x00, 0x00), 0);
 
     return label;
 }

@@ -48,6 +48,7 @@
 static struct bflb_device_s *cam0;
 static struct bflb_device_s *adc;
 
+static int filesystem_init(void);
 static void cam_init(void);
 static void adc_init(void);
 
@@ -60,6 +61,8 @@ static void lv_log_print_g_cb(const char *buf)
 int main(void)
 {
     board_init();
+
+    label_tfcard_state_update(!filesystem_init());
 
     struct bflb_device_s *gpio;
     gpio = bflb_device_get_by_name("gpio");
@@ -114,6 +117,61 @@ int main(void)
         lv_task_handler();
         bflb_mtimer_delay_ms(1);
     }
+}
+
+#include "ff.h"
+#include "fatfs_diskio_register.h"
+
+static int filesystem_init(void)
+{
+    static FATFS fs;
+    static __attribute((aligned(8))) uint32_t workbuf[4 * 1024];
+
+    MKFS_PARM fs_para = {
+        .fmt = FM_FAT32,     /* Format option (FM_FAT, FM_FAT32, FM_EXFAT and FM_SFD) */
+        .n_fat = 1,          /* Number of FATs */
+        .align = 0,          /* Data area alignment (sector) */
+        .n_root = 1,         /* Number of root directory entries */
+        .au_size = 512 * 32, /* Cluster size (byte) */
+    };
+
+    FRESULT ret;
+
+    board_sdh_gpio_init();
+
+    fatfs_sdh_driver_register();
+
+    ret = f_mount(&fs, "/sd", 1);
+
+    if (ret == FR_NO_FILESYSTEM) {
+        LOG_W("No filesystem yet, try to be formatted...\r\n");
+
+        ret = f_mkfs("/sd", &fs_para, workbuf, sizeof(workbuf));
+
+        if (ret != FR_OK) {
+            LOG_F("fail to make filesystem\r\n");
+            return ret;
+        }
+
+        if (ret == FR_OK) {
+            LOG_I("done with formatting.\r\n");
+            LOG_I("first start to unmount.\r\n");
+            ret = f_mount(NULL, "/sd", 1);
+            LOG_I("then start to remount.\r\n");
+        }
+    } else if (ret != FR_OK) {
+        LOG_F("fail to mount filesystem,error= %d\r\n", ret);
+        LOG_F("SD card might fail to initialise.\r\n");
+        return ret;
+    } else {
+        LOG_D("Succeed to mount filesystem\r\n");
+    }
+
+    if (ret == FR_OK) {
+        LOG_I("FileSystem cluster size:%d-sectors (%d-Byte)\r\n", fs.csize, fs.csize * 512);
+    }
+
+    return ret;
 }
 
 static void cam_isr(int irq, void *arg);
@@ -298,6 +356,9 @@ void btn_adc_event_handled(lv_event_t *e)
         // LV_LOG_USER("%s checked %u", label->text, is_btn_checked);
         if (adc) {
             (void (*[])(struct bflb_device_s *)){ bflb_adc_stop_conversion, bflb_adc_start_conversion }[is_btn_checked](adc);
+            if (!is_btn_checked) {
+                lv_label_set_text(label, "ADC");
+            }
         }
     }
 }
