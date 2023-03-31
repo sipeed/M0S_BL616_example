@@ -229,9 +229,7 @@ static void adc_init(void)
     adc = bflb_device_get_by_name("adc");
 
     /**
-     *  adc clock = XCLK /  2 / 32 / 128 (14B) =  4.882K 
-     *                             /  60 (12B) = 10.38276K
-     *  adc clock = XCLK / 1 /  20 / 128 (14B) = 15.625K
+     *  adc clock = XCLK / 2 / 20 / 64(14B) = 15.625K
      */
     struct bflb_adc_config_s cfg;
     cfg.clk_div = ADC_CLK_DIV_20;
