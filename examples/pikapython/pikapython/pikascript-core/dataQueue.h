@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -25,7 +25,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-
+#ifdef __cplusplus
+extern "C" {
+#endif
 #ifndef __DATA_QUEUE__H
 #define __DATA_QUEUE__H
 #include "dataArgs.h"
@@ -74,13 +76,16 @@ void queue_init(Queue* queue);
 ByteQueue *byteQueue_init( ByteQueue *queue, 
                             void *buffer, 
                             uint_fast16_t size, 
-                            PIKA_BOOL is_queue_full);
-PIKA_BOOL byteQueue_readOne(ByteQueue *queue, uint8_t *byte_ptr);
-PIKA_BOOL byteQueue_peekOne(ByteQueue *queue, uint8_t *byte_ptr);
+                            pika_bool is_queue_full);
+pika_bool byteQueue_readOne(ByteQueue *queue, uint8_t *byte_ptr);
+pika_bool byteQueue_peekOne(ByteQueue *queue, uint8_t *byte_ptr);
 void byteQueue_resetPeek(ByteQueue *queue);
 void byteQueue_dropAllPeeked(ByteQueue *queue);
 uint_fast16_t byteQueue_getPeekedNumber(ByteQueue *queue);
 uint_fast16_t byteQueue_peekAvailableCount(ByteQueue *queue);
-PIKA_BOOL byteQueue_writeOne(ByteQueue *queue, uint8_t byte);
+pika_bool byteQueue_writeOne(ByteQueue *queue, uint8_t byte);
 
+#endif
+#ifdef __cplusplus
+}
 #endif

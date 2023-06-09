@@ -25,7 +25,7 @@ Arg* PikaStdData_Tuple___next__(PikaObj* self) {
     int __iter_i = args_getInt(self->list, "__iter_i");
     Arg* res = PikaStdData_Tuple_get(self, __iter_i);
     if (NULL == res) {
-        return arg_newNull();
+        return arg_newNone();
     }
     args_setInt(self->list, "__iter_i", __iter_i + 1);
     return res;
@@ -43,11 +43,14 @@ Arg* PikaStdData_Tuple___getitem__(PikaObj* self, Arg* __key) {
 }
 
 void PikaStdData_Tuple___del__(PikaObj* self) {
+    if (0 == obj_getInt(self, "needfree")) {
+        return;
+    }
     Args* list = obj_getPtr(self, "list");
     args_deinit(list);
 }
 
-char* PikaStdLib_SysObj_str(PikaObj* self, Arg* arg);
+char* builtins_str(PikaObj* self, Arg* arg);
 char* PikaStdData_Tuple___str__(PikaObj* self) {
     Arg* str_arg = arg_newStr("(");
     PikaList* list = obj_getPtr(self, "list");
@@ -56,12 +59,16 @@ char* PikaStdData_Tuple___str__(PikaObj* self) {
     while (PIKA_TRUE) {
         Arg* item = pikaList_getArg(list, i);
         if (NULL == item) {
+            if (i == 1) {
+                // single tuple
+                str_arg = arg_strAppend(str_arg, ",");
+            }
             break;
         }
         if (i != 0) {
             str_arg = arg_strAppend(str_arg, ", ");
         }
-        char* item_str = PikaStdLib_SysObj_str(self, item);
+        char* item_str = builtins_str(self, item);
         if (arg_getType(item) == ARG_TYPE_STRING) {
             str_arg = arg_strAppend(str_arg, "'");
         }

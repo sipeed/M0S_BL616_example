@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -24,6 +24,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+
 
 #include "__instruction_def.h"
 
@@ -96,3 +97,5 @@ def_ins(ASS)
 def_ins(EXP)
 /* jump no zero */
 def_ins(JNZ)
+/* tuple */
+def_ins(TPL)

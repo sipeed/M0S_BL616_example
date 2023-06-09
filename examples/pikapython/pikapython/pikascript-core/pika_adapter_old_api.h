@@ -1,3 +1,7 @@
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef __PIKA_ADAPTER_OLD_API_H__
 #define __PIKA_ADAPTER_OLD_API_H__
 
@@ -13,10 +17,9 @@
 #define __platform_enable_irq_handle pika_platform_enable_irq_handle
 #define __platform_disable_irq_handle pika_platform_disable_irq_handle
 #define __platform_printf pika_platform_printf
-#define __platform_sprintf pika_platform_sprintf
-#define __platform_vsprintf pika_platform_vsprintf
 #define __platform_vsnprintf pika_platform_vsnprintf
-#define __platform_snprintf pika_platform_snprintf
+#define __platform_sprintf pika_sprintf
+#define pika_platform_sprintf pika_sprintf
 #define __platform_strdup pika_platform_strdup
 #define __platform_tick_from_millisecond pika_platform_tick_from_millisecond
 #define __platform_malloc pika_platform_malloc
@@ -79,7 +82,17 @@
 #define pika_platform_timer_remain pika_platform_thread_timer_remain
 #define pika_platform_timer_now pika_platform_thread_timer_now
 #define pika_platform_timer_usleep pika_platform_thread_timer_usleep
+#define arg_newNull arg_newNone
+#define arg_setNull arg_setNone
+
+#define PIKA_BOOL pika_bool
+#define PIKA_TRUE pika_true
+#define PIKA_FALSE pika_false
 
 #endif
 
+#endif
+
+#ifdef __cplusplus
+}
 #endif

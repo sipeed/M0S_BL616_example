@@ -1,6 +1,6 @@
 ﻿/*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -24,6 +24,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #ifndef _arg__H
 #define _arg__H
@@ -95,13 +99,15 @@ Arg* arg_setName(Arg* self, char* name);
 Arg* arg_setNameHash(Arg* self, Hash nameHash);
 Arg* arg_setContent(Arg* self, uint8_t* content, uint32_t size);
 Arg* arg_newContent(uint32_t size);
+void arg_refcntInc(Arg* self);
+void arg_refcntDec(Arg* self);
 
 static inline void arg_setType(Arg* self, ArgType type) {
     self->type = type;
 }
 
 static inline Hash arg_getNameHash(Arg* self) {
-    pika_assert(self != 0);
+    pika_assert(self != NULL);
     return self->name_hash;
 }
 
@@ -114,18 +120,18 @@ uint32_t arg_getContentSize(Arg* self);
 Hash hash_time33(char* str);
 
 Arg* arg_setInt(Arg* self, char* name, int64_t val);
-Arg* arg_setBool(Arg* self, char* name, PIKA_BOOL val);
+Arg* arg_setBool(Arg* self, char* name, pika_bool val);
 Arg* arg_setFloat(Arg* self, char* name, pika_float val);
 Arg* arg_setPtr(Arg* self, char* name, ArgType type, void* pointer);
 Arg* arg_setStr(Arg* self, char* name, char* string);
-Arg* arg_setNull(Arg* self);
+Arg* arg_setNone(Arg* self);
 Arg* arg_setBytes(Arg* self, char* name, uint8_t* src, size_t size);
 
 static inline Arg* arg_newInt(int64_t val) {
     return arg_setInt(NULL, (char*)"", (val));
 }
 
-static inline Arg* arg_newBool(PIKA_BOOL val) {
+static inline Arg* arg_newBool(pika_bool val) {
     return arg_setBool(NULL, (char*)"", (val));
 }
 
@@ -141,8 +147,8 @@ static inline Arg* arg_newStr(char* string) {
     return arg_setStr(NULL, (char*)"", (string));
 }
 
-static inline Arg* arg_newNull() {
-    return arg_setNull(NULL);
+static inline Arg* arg_newNone() {
+    return arg_setNone(NULL);
 }
 
 static inline Arg* arg_newBytes(uint8_t* src, size_t size) {
@@ -150,7 +156,7 @@ static inline Arg* arg_newBytes(uint8_t* src, size_t size) {
 }
 
 int64_t arg_getInt(Arg* self);
-PIKA_BOOL arg_getBool(Arg* self);
+pika_bool arg_getBool(Arg* self);
 pika_float arg_getFloat(Arg* self);
 void* arg_getPtr(Arg* self);
 char* arg_getStr(Arg* self);
@@ -158,6 +164,7 @@ uint8_t* arg_getBytes(Arg* self);
 size_t arg_getBytesSize(Arg* self);
 Arg* arg_copy(Arg* argToBeCopy);
 Arg* arg_copy_noalloc(Arg* argToBeCopy, Arg* argToBeCopyTo);
+Arg* arg_copy_content(Arg* arg_dict, Arg* arg_src);
 
 void arg_deinit(Arg* self);
 
@@ -175,7 +182,7 @@ Arg* arg_setHeapStruct(Arg* self,
 void* arg_getHeapStruct(Arg* self);
 void arg_deinitHeap(Arg* self);
 Arg* arg_toStrArg(Arg* arg);
-void arg_print(Arg* self, PIKA_BOOL in_REPL, char* end);
+void arg_print(Arg* self, pika_bool in_REPL, char* end);
 Arg* arg_loadFile(Arg* self, char* filename);
 
 #define ARG_FLAG_SERIALIZED 0x01
@@ -269,10 +276,24 @@ static inline uint8_t argType_isCallable(ArgType type) {
             (type) == ARG_TYPE_METHOD_NATIVE_CONSTRUCTOR);
 }
 
+static inline uint8_t argType_isConstructor(ArgType type) {
+    return ((type) == ARG_TYPE_METHOD_CONSTRUCTOR ||
+            (type) == ARG_TYPE_METHOD_NATIVE_CONSTRUCTOR);
+}
+
 static inline uint8_t argType_isNative(ArgType type) {
     return ((type) == ARG_TYPE_METHOD_NATIVE ||
             (type) == ARG_TYPE_METHOD_NATIVE_CONSTRUCTOR);
 }
+
+#define arg_isObject(__self) \
+    ((__self != NULL) && (argType_isObject(arg_getType(__self))))
+#define arg_isCallable(__self) \
+    ((__self != NULL) && (argType_isCallable(arg_getType(__self))))
+#define arg_isConstructor(__self) \
+    ((__self != NULL) && (argType_isConstructor(arg_getType(__self))))
+#define arg_isNative(__self) \
+    ((__self != NULL) && (argType_isNative(arg_getType(__self))))
 
 #define arg_newReg(__name, __size)           \
     Arg __name = {0};                        \
@@ -280,7 +301,11 @@ static inline uint8_t argType_isNative(ArgType type) {
     arg_init_stack(&__name, __##__name##_buff, __size)
 
 void arg_init_stack(Arg* self, uint8_t* buffer, uint32_t size);
-PIKA_BOOL arg_isEqual(Arg* self, Arg* other);
+pika_bool arg_isEqual(Arg* self, Arg* other);
 Hash hash_time33EndWith(char* str, char end);
 
+#endif
+
+#ifdef __cplusplus
+}
 #endif

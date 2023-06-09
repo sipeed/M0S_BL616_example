@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -90,17 +90,45 @@ char* strAppendWithSize(char* strOut, char* pData, int32_t Size) {
 
     return strOut;
 }
+const char bracketStart[] = {'(', '[', '{', '\'', '\"'};
+const char bracketEnd[] = {')', ']', '}', '\'', '\"'};
+#define BRACKET_TYPE_NUM (sizeof(bracketStart) / sizeof(char))
+
+int _strCountSign(char* strIn, char sign, pika_bool bracketDepth0) {
+    int32_t iCount = 0;
+    int32_t iTotalDepth = 0;
+    pika_bool bEscaped = pika_false;
+    for (size_t i = 0; strIn[i] != '\0'; i++) {
+        if (!bracketDepth0) {
+            if (strIn[i] == sign) {
+                iCount++;
+            }
+            continue;
+        }
+        char cCurrentChar = strIn[i];
+        if (cCurrentChar == '\\') {
+            bEscaped = !bEscaped;
+            continue;
+        }
+        if (!bEscaped) {
+            for (int j = 0; j < BRACKET_TYPE_NUM; j++) {
+                if (cCurrentChar == bracketStart[j]) {
+                    iTotalDepth++;
+                } else if (cCurrentChar == bracketEnd[j]) {
+                    iTotalDepth--;
+                }
+            }
+        }
+        if (cCurrentChar == sign && iTotalDepth == 0) {
+            iCount++;
+        }
+        bEscaped = pika_false;
+    }
+    return iCount;
+}
 
 int32_t strCountSign(char* strIn, char sign) {
-    pika_assert(NULL != strIn);
-    int count = 0;
-    while (*strIn) {
-        if (*strIn == sign) {
-            count++;
-        }
-        strIn++;
-    }
-    return count;
+    return _strCountSign(strIn, sign, 0);
 }
 
 char* strReplaceChar(char* strIn, char src, char dst) {
@@ -123,6 +151,7 @@ size_t strGetSize(char* pData) {
 }
 
 char* strPointToLastToken(char* strIn, char sign) {
+    pika_assert(NULL != strIn);
     if (!strIsContain(strIn, sign)) {
         return strIn;
     }
@@ -218,6 +247,10 @@ int32_t strEqu(char* str1, char* str2) {
     if (NULL == str1 || NULL == str2) {
         return 0;
     }
+    if (str1[0] != str2[0]) {
+        /* fast return */
+        return 0;
+    }
     return !strcmp(str1, str2);
 }
 
@@ -233,6 +266,7 @@ char* strRemovePrefix(char* inputStr, char* prefix, char* outputStr) {
 }
 
 int32_t strIsContain(char* str, char ch) {
+    pika_assert(NULL != str);
     while (*str) {
         if (*str == ch) {
             return 1;
@@ -357,6 +391,10 @@ int strPathGetFolder(char* input, char* output) {
 }
 
 int strPathGetFileName(char* input, char* output) {
+    if (!strIsContain(input, '/') && !strIsContain(input, '\\')) {
+        strCopy(output, input);
+        return 0;
+    };
     size_t input_len = strlen(input);
     char* input_format = (char*)pikaMalloc(input_len + 1);
     strPathFormat(input, input_format);
@@ -374,4 +412,41 @@ int strPathGetFileName(char* input, char* output) {
     output[i - j - 1] = '\0';
     pikaFree(input_format, input_len + 1);
     return i - j - 1;
+}
+
+int strGetIndent(char* string) {
+    int indent = 0;
+    int len = strGetSize(string);
+    for (int j = 0; j < len; j++) {
+        if (string[j] == ' ') {
+            indent++;
+        } else {
+            return indent;
+        }
+    }
+    return indent;
+}
+
+int strIsBlank(char* string) {
+    int len = strGetSize(string);
+    for (int j = 0; j < len; j++) {
+        if (string[j] != ' ' && string[j] != '\t' && string[j] != '\r' &&
+            string[j] != '\n') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int strOnly(char* string, char ch) {
+    int len = strGetSize(string);
+    if (len == 0) {
+        return 0;
+    }
+    for (int j = 0; j < len; j++) {
+        if (string[j] != ch) {
+            return 0;
+        }
+    }
+    return 1;
 }
