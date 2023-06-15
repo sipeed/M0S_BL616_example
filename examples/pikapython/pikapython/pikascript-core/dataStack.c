@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -93,7 +93,7 @@ int32_t stack_deinit(Stack* stack) {
 void stack_pushPyload(Stack* stack,
                       uint8_t* in,
                       size_t size,
-                      PIKA_BOOL is_sample_copy) {
+                      pika_bool is_sample_copy) {
     size_t stack_size_after_push =
         size + (stack->sp - arg_getContent(stack->stack_pyload));
     if (stack_size_after_push > stack->stack_totle_size) {
@@ -101,9 +101,9 @@ void stack_pushPyload(Stack* stack,
             "OverflowError: pika VM stack overflow, please use bigger "
             "PIKA_STACK_BUFF_SIZE\r\n");
         pika_platform_printf("Info: stack size request: %d\r\n",
-                          (int)stack_size_after_push);
+                             (int)stack_size_after_push);
         pika_platform_printf("Info: stack size now: %d\r\n",
-                          (int)stack->stack_totle_size);
+                             (int)stack->stack_totle_size);
         while (1) {
         }
     }
@@ -113,9 +113,9 @@ void stack_pushPyload(Stack* stack,
     } else {
         pika_platform_memcpy(top, in, sizeof(Arg));
         pika_platform_memcpy(top->content, ((Arg*)in)->_.buffer,
-                          size - sizeof(Arg));
+                             size - sizeof(Arg));
         /* transfer to serialized form */
-        arg_setSerialized(top, PIKA_TRUE);
+        arg_setSerialized(top, pika_true);
     }
     stack->sp += size;
 }
@@ -128,8 +128,8 @@ uint8_t* stack_popPyload(Stack* stack, int32_t size) {
     return stack->sp;
 }
 
-static int32_t _stack_pushArg(Stack* stack, Arg* arg, PIKA_BOOL is_alloc) {
-    PIKA_BOOL is_big_arg = PIKA_FALSE;
+static int32_t _stack_pushArg(Stack* stack, Arg* arg, pika_bool is_alloc) {
+    pika_bool is_big_arg = pika_false;
     stack->top++;
     size_t size = arg_getTotleSize(arg);
 //! if you unsure about the __impl_pikaMalloc, uncomment this to force alignment
@@ -138,21 +138,20 @@ static int32_t _stack_pushArg(Stack* stack, Arg* arg, PIKA_BOOL is_alloc) {
     size = (size + 4 - 1) & ~(4 - 1);
 #endif
     /* add ref_cnt to keep object in stack */
-    if (argType_isObject(arg_getType(arg))) {
-        obj_refcntInc((PikaObj*)arg_getPtr(arg));
-    }
+    arg_refcntInc(arg);
 
     if (arg_isSerialized(arg)) {
-        is_big_arg = PIKA_TRUE;
+        is_big_arg = pika_true;
     }
 
     if (is_big_arg) {
         /* push a pointer to this arg */
         stack_pushSize(stack, -1);
-        stack_pushPyload(stack, (uint8_t*)&arg, sizeof(Arg*), PIKA_TRUE);
+        stack_pushPyload(stack, (uint8_t*)&arg, sizeof(Arg*), pika_true);
     } else {
         stack_pushSize(stack, size);
-        stack_pushPyload(stack, (uint8_t*)arg, size, (PIKA_BOOL)arg_isSerialized(arg));
+        stack_pushPyload(stack, (uint8_t*)arg, size,
+                         (pika_bool)arg_isSerialized(arg));
     }
 
     if (is_big_arg) {
@@ -168,10 +167,13 @@ static int32_t _stack_pushArg(Stack* stack, Arg* arg, PIKA_BOOL is_alloc) {
 
 int32_t stack_pushArg(Stack* stack, Arg* arg) {
     pika_assert(arg != NULL);
-    if (arg_isSerialized(arg)) {
-        return _stack_pushArg(stack, arg, PIKA_TRUE);
+    if (arg_isObject(arg)) {
+        pika_assert(obj_checkAlive(arg_getPtr(arg)));
     }
-    return _stack_pushArg(stack, arg, PIKA_FALSE);
+    if (arg_isSerialized(arg)) {
+        return _stack_pushArg(stack, arg, pika_true);
+    }
+    return _stack_pushArg(stack, arg, pika_false);
 }
 
 int32_t stack_pushStr(Stack* stack, char* str) {
@@ -179,15 +181,15 @@ int32_t stack_pushStr(Stack* stack, char* str) {
     return stack_pushArg(stack, newArg);
 }
 
-Arg* _stack_popArg(Stack* stack, Arg* arg_dict, PIKA_BOOL is_alloc) {
-    PIKA_BOOL is_big_arg = PIKA_FALSE;
+Arg* _stack_popArg(Stack* stack, Arg* arg_dict, pika_bool is_alloc) {
+    pika_bool is_big_arg = pika_false;
     if (stack->top == 0) {
         return NULL;
     }
     stack->top--;
     int32_t size = stack_popSize(stack);
     if (size == -1) {
-        is_big_arg = PIKA_TRUE;
+        is_big_arg = pika_true;
         size = sizeof(Arg*);
     }
     Arg* arg = NULL;
@@ -202,21 +204,18 @@ Arg* _stack_popArg(Stack* stack, Arg* arg_dict, PIKA_BOOL is_alloc) {
         }
     }
 
-    ArgType type = arg_getType(arg);
     /* decrase ref_cnt */
-    if (argType_isObject(type)) {
-        obj_refcntDec((PikaObj*)arg_getPtr(arg));
-    }
+    arg_refcntDec(arg);
     pika_assert(arg->flag < ARG_FLAG_MAX);
     return arg;
 }
 
 Arg* stack_popArg_alloc(Stack* stack) {
-    return _stack_popArg(stack, NULL, PIKA_TRUE);
+    return _stack_popArg(stack, NULL, pika_true);
 }
 
 Arg* stack_popArg(Stack* stack, Arg* arg_dict) {
-    return _stack_popArg(stack, arg_dict, PIKA_FALSE);
+    return _stack_popArg(stack, arg_dict, pika_false);
 }
 
 char* stack_popStr(Stack* stack, char* outBuff) {

@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -31,14 +31,49 @@
 #include "BaseObj.h"
 #include "PikaCompiler.h"
 #include "PikaPlatform.h"
+#include "dataArg.h"
 #include "dataArgs.h"
 #include "dataMemory.h"
 #include "dataQueue.h"
 #include "dataString.h"
 #include "dataStrs.h"
+#if __linux
+#include "signal.h"
+#include "termios.h"
+#include "unistd.h"
+#endif
 
-static volatile Arg* _help_modules_cmodule = NULL;
-static volatile PIKA_BOOL in_root_obj = PIKA_FALSE;
+extern volatile VMSignal g_PikaVMSignal;
+volatile PikaObjState g_PikaObjState = {
+    .helpModulesCmodule = NULL,
+    .inRootObj = pika_false,
+#if PIKA_GC_MARK_SWEEP_ENABLE
+    .objCnt = 0,
+    .objCntMax = 0,
+    .objCntLastGC = 0,
+    .gcChain = NULL,
+    .markSweepBusy = 0,
+#endif
+};
+
+static volatile ShellConfig g_repl_shell;
+
+PikaObj* New_PikaStdData_Dict(Args* args);
+PikaObj* New_PikaStdData_dict_keys(Args* args);
+PikaObj* New_PikaStdData_List(Args* args);
+PikaObj* New_PikaStdData_Tuple(Args* args);
+void PikaStdData_Tuple___init__(PikaObj* self);
+void PikaStdData_List___init__(PikaObj* self);
+void PikaStdData_List_append(PikaObj* self, Arg* arg);
+void PikaStdData_Dict_set(PikaObj* self, char* key, Arg* value);
+void PikaStdData_Dict___init__(PikaObj* self);
+void _mem_cache_deinit(void);
+void _VMEvent_deinit(void);
+void pikaGC_markObj(PikaGC* gc, PikaObj* self);
+void _pikaGC_mark(PikaGC* gc);
+void obj_dump(PikaObj* self);
+void Locals_deinit(PikaObj* self);
+static void disable_raw_mode(void);
 
 static enum shellCTRL __obj_shellLineHandler_REPL(PikaObj* self,
                                                   char* input_line,
@@ -108,14 +143,28 @@ char* fast_itoa(char* buf, uint32_t val) {
 
 static int32_t obj_deinit_no_del(PikaObj* self) {
     /* free the list */
+    Locals_deinit(self);
     args_deinit(self->list);
+#if PIKA_KERNAL_DEBUG_ENABLE
+    if (NULL != self->aName) {
+        arg_deinit(self->aName);
+    }
+#endif
+    extern volatile PikaObj* __pikaMain;
+    /* remove self from gc chain */
+    obj_removeGcChain(self);
     /* free the pointer */
     pikaFree(self, sizeof(PikaObj));
-    self = NULL;
+    if (self == (PikaObj*)__pikaMain) {
+        __pikaMain = NULL;
+    }
     return 0;
 }
 
 int obj_GC(PikaObj* self) {
+    if (!obj_checkAlive(self)) {
+        return 0;
+    }
     obj_refcntDec(self);
     int ref_cnt = obj_refcntNow(self);
     if (ref_cnt <= 0) {
@@ -125,7 +174,12 @@ int obj_GC(PikaObj* self) {
 }
 
 int32_t obj_deinit(PikaObj* self) {
-    Arg* del = obj_getMethodArg(self, "__del__");
+    pikaGC_lock();
+    pika_bool bisRoot = pika_false;
+#if PIKA_KERNAL_DEBUG_ENABLE
+    self->isAlive = pika_false;
+#endif
+    Arg* del = obj_getMethodArgWithFullPath(self, "__del__");
     if (NULL != del) {
         const uint8_t bytes[] = {
             0x04, 0x00, 0x00, 0x00, /* instruct array size */
@@ -139,19 +193,26 @@ int32_t obj_deinit(PikaObj* self) {
     }
     extern volatile PikaObj* __pikaMain;
     if (self == (PikaObj*)__pikaMain) {
-        void _mem_cache_deinit(void);
-        void _VMEvent_deinit(void);
+        bisRoot = pika_true;
         _mem_cache_deinit();
 #if PIKA_EVENT_ENABLE
         _VMEvent_deinit();
 #endif
-        if (NULL != _help_modules_cmodule) {
-            arg_deinit((Arg*)_help_modules_cmodule);
-            _help_modules_cmodule = NULL;
+        if (NULL != g_PikaObjState.helpModulesCmodule) {
+            arg_deinit(g_PikaObjState.helpModulesCmodule);
+            g_PikaObjState.helpModulesCmodule = NULL;
         }
-        __pikaMain = NULL;
     }
-    return obj_deinit_no_del(self);
+    int32_t ret = obj_deinit_no_del(self);
+    pikaGC_unlock();
+    if (bisRoot) {
+        pikaGC_markSweep();
+        shConfig_deinit((ShellConfig*)&g_repl_shell);
+#if __linux
+        disable_raw_mode();
+#endif
+    }
+    return ret;
 }
 
 PIKA_RES obj_setInt(PikaObj* self, char* argPath, int64_t val) {
@@ -237,18 +298,19 @@ int64_t obj_getInt(PikaObj* self, char* argPath) {
     return res;
 }
 
-PIKA_BOOL obj_getBool(PikaObj* self, char* argPath) {
+pika_bool obj_getBool(PikaObj* self, char* argPath) {
     PikaObj* obj = obj_getHostObj(self, argPath);
     if (NULL == obj) {
-        return PIKA_FALSE;
+        return pika_false;
     }
     char* argName = strPointToLastToken(argPath, '.');
-    PIKA_BOOL res = args_getBool(obj->list, argName);
+    pika_bool res = args_getBool(obj->list, argName);
     return res;
 }
 
 Arg* obj_getArg(PikaObj* self, char* argPath) {
-    PIKA_BOOL is_temp = PIKA_FALSE;
+    pika_assert(obj_checkAlive(self));
+    pika_bool is_temp = pika_false;
     PikaObj* obj = obj_getHostObjWithIsTemp(self, argPath, &is_temp);
     if (NULL == obj) {
         return NULL;
@@ -295,34 +357,73 @@ size_t obj_loadBytes(PikaObj* self, char* argPath, uint8_t* out_buff) {
     return size_mem;
 }
 
-static PIKA_RES __obj_setArg(PikaObj* self,
-                             char* argPath,
-                             Arg* arg,
-                             uint8_t is_copy) {
+void obj_setName(PikaObj* self, char* name) {
+#if !PIKA_KERNAL_DEBUG_ENABLE
+    return;
+#else
+    if (strEqu(name, "self")) {
+        return;
+    }
+    if (NULL != self->aName) {
+        if (!strstr(self->name, name)) {
+            self->aName = arg_strAppend(self->aName, "|");
+            self->aName = arg_strAppend(self->aName, name);
+        }
+    } else {
+        self->aName = arg_newStr(name);
+    }
+    self->name = arg_getStr(self->aName);
+#endif
+}
+
+static PIKA_RES _obj_setArg(PikaObj* self,
+                            char* argPath,
+                            Arg* arg,
+                            uint8_t is_copy) {
+    pika_assert(obj_checkAlive(self));
     /* setArg would copy arg */
-    PikaObj* obj = obj_getHostObj(self, argPath);
-    if (NULL == obj) {
+    PikaObj* host = obj_getHostObj(self, argPath);
+    PikaObj* oNew = NULL;
+    pika_bool bNew = pika_false;
+    if (NULL == host) {
         /* object no found */
         return PIKA_RES_ERR_ARG_NO_FOUND;
     }
-    char* argName = strPointToLastToken(argPath, '.');
-    Arg* newArg;
+    char* sArgName = strPointToLastToken(argPath, '.');
+    Arg* aNew;
     if (is_copy) {
-        newArg = arg_copy(arg);
+        aNew = arg_copy(arg);
     } else {
-        newArg = arg;
+        aNew = arg;
     }
-    newArg = arg_setName(newArg, argName);
-    args_setArg(obj->list, newArg);
+    aNew = arg_setName(aNew, sArgName);
+    if (arg_isObject(aNew)) {
+        oNew = arg_getPtr(aNew);
+        bNew = pika_true;
+        pika_assert(obj_checkAlive(oNew));
+#if PIKA_KERNAL_DEBUG_ENABLE
+        if (host != oNew) {
+            /* skip self ref */
+            oNew->parent = host;
+        }
+#endif
+        obj_setName(oNew, sArgName);
+    }
+    args_setArg(host->list, aNew);
+    /* enable mark sweep to collect this object */
+    if (bNew) {
+        /* only enable mark sweep after setArg */
+        obj_enableGC(oNew);
+    }
     return PIKA_RES_OK;
 }
 
 PIKA_RES obj_setArg(PikaObj* self, char* argPath, Arg* arg) {
-    return __obj_setArg(self, argPath, arg, 1);
+    return _obj_setArg(self, argPath, arg, 1);
 };
 
 PIKA_RES obj_setArg_noCopy(PikaObj* self, char* argPath, Arg* arg) {
-    return __obj_setArg(self, argPath, arg, 0);
+    return _obj_setArg(self, argPath, arg, 0);
 }
 
 void* obj_getPtr(PikaObj* self, char* argPath) {
@@ -355,28 +456,101 @@ char* obj_getStr(PikaObj* self, char* argPath) {
     return res;
 }
 
-PikaObj* obj_getClassObjByNewFun(PikaObj* context,
-                                 char* name,
-                                 NewFun newClassFun) {
-    Args* initArgs = New_args(NULL);
-    PikaObj* thisClass = newClassFun(initArgs);
-    thisClass->constructor = newClassFun;
-    thisClass->refcnt = 0;
-    args_deinit(initArgs);
-    return thisClass;
+PikaObj* obj_newObjFromConstructor(PikaObj* context,
+                                   char* name,
+                                   NewFun constructor) {
+    PikaObj* self = constructor(NULL);
+    self->constructor = constructor;
+    self->refcnt = 1;
+    return self;
 }
 
-Arg* _obj_getProp(PikaObj* obj, char* name) {
-    NativeProperty* prop = obj_getPtr(obj, "@p");
+static PikaObj* _pika_new_obj_with_args(PikaObj* (*constructor)(),
+                                        void (*init_func)(PikaObj*),
+                                        int num_args,
+                                        va_list args) {
+    PikaObj* obj = newNormalObj(constructor);
+    init_func(obj);
+
+    if (constructor == New_PikaStdData_Tuple ||
+        constructor == New_PikaStdData_List) {
+        for (int i = 0; i < num_args; i++) {
+            Arg* arg = va_arg(args, Arg*);
+            if (num_args == 1 && NULL == arg) {
+                /* empty tuple */
+                return obj;
+            }
+            PikaStdData_List_append(obj, arg);
+            arg_deinit(arg);
+        }
+    } else if (constructor == New_PikaStdData_Dict) {
+        if (num_args == 1) {
+            /* empty dict */
+            return obj;
+        }
+        for (int i = 0; i + 1 < num_args; i += 2) {
+            Arg* aKey = va_arg(args, Arg*);
+            char* sKey = arg_getStr(aKey);
+            Arg* value = va_arg(args, Arg*);
+            PikaStdData_Dict_set(obj, sKey, value);
+            arg_deinit(aKey);
+            arg_deinit(value);
+        }
+    }
+
+    return obj;
+}
+
+PikaObj* _pika_tuple_new(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    PikaObj* tuple = _pika_new_obj_with_args(
+        New_PikaStdData_Tuple, PikaStdData_Tuple___init__, num_args, args);
+
+    va_end(args);
+    return tuple;
+}
+
+PikaObj* _pika_list_new(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    PikaObj* list = _pika_new_obj_with_args(
+        New_PikaStdData_List, PikaStdData_List___init__, num_args, args);
+
+    va_end(args);
+    return list;
+}
+
+PikaObj* _pika_dict_new(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+    PikaObj* dict = _pika_new_obj_with_args(
+        New_PikaStdData_Dict, PikaStdData_Dict___init__, num_args, args);
+    va_end(args);
+    return dict;
+}
+
+NativeProperty* obj_getProp(PikaObj* self) {
+    NativeProperty* prop = obj_getPtr(self, "@p");
     PikaObj* class_obj = NULL;
-    Arg* method = NULL;
     if (NULL == prop) {
-        if (NULL != obj->constructor) {
-            class_obj = obj_getClassObj(obj);
+        if (NULL != self->constructor) {
+            class_obj = obj_getClassObj(self);
             prop = obj_getPtr(class_obj, "@p");
         }
     }
+    if (NULL != class_obj) {
+        obj_deinit_no_del(class_obj);
+    }
+    return prop;
+}
+
+Arg* _obj_getPropArg(PikaObj* obj, char* name) {
+    NativeProperty* prop = obj_getProp(obj);
     Hash method_hash = hash_time33(name);
+    Arg* aMethod = NULL;
     while (1) {
         if (prop == NULL) {
             break;
@@ -398,7 +572,7 @@ Arg* _obj_getProp(PikaObj* obj, char* name) {
                 mid = (right + left) >> 1;
                 Arg* prop_this = (Arg*)(prop->methodGroup + mid);
                 if (prop_this->name_hash == method_hash) {
-                    method = prop_this;
+                    aMethod = prop_this;
                     goto exit;
                 } else if (prop_this->name_hash < method_hash) {
                     left = mid + 1;
@@ -412,7 +586,7 @@ Arg* _obj_getProp(PikaObj* obj, char* name) {
         for (int i = 0; i < (int)prop->methodGroupCount; i++) {
             Arg* prop_this = (Arg*)(prop->methodGroup + i);
             if (prop_this->name_hash == method_hash) {
-                method = prop_this;
+                aMethod = prop_this;
                 goto exit;
             }
         }
@@ -421,34 +595,44 @@ Arg* _obj_getProp(PikaObj* obj, char* name) {
         prop = (NativeProperty*)prop->super;
     }
 exit:
-    if (NULL != class_obj) {
-        obj_deinit_no_del(class_obj);
-    }
-    return method;
+    return aMethod;
 }
 
-Arg* _obj_getMethodArg(PikaObj* obj, char* methodPath, Arg* arg_reg) {
-    Arg* method = NULL;
-    char* methodName = strPointToLastToken(methodPath, '.');
-    method = obj_getArg(obj, methodName);
-    if (NULL != method) {
-        method = arg_copy_noalloc(method, arg_reg);
+Arg* _obj_getMethodArg(PikaObj* obj, char* methodName, Arg* arg_reg) {
+    Arg* aMethod = NULL;
+    aMethod = obj_getArg(obj, methodName);
+    if (NULL != aMethod) {
+        aMethod = arg_copy_noalloc(aMethod, arg_reg);
         goto exit;
     }
-    method = _obj_getProp(obj, methodName);
-    if (NULL != method) {
-        goto exit;
-    }
+    aMethod = _obj_getPropArg(obj, methodName);
 exit:
-    return method;
+    return aMethod;
 }
 
-Arg* obj_getMethodArg(PikaObj* obj, char* methodPath) {
-    return _obj_getMethodArg(obj, methodPath, NULL);
+Arg* _obj_getMethodArgWithFullPath(PikaObj* obj,
+                                   char* methodPath,
+                                   Arg* arg_reg) {
+    char* methodName = strPointToLastToken(methodPath, '.');
+    return _obj_getMethodArg(obj, methodName, arg_reg);
 }
 
-Arg* obj_getMethodArg_noalloc(PikaObj* obj, char* methodPath, Arg* arg_reg) {
-    return _obj_getMethodArg(obj, methodPath, arg_reg);
+Arg* obj_getMethodArgWithFullPath(PikaObj* obj, char* methodPath) {
+    return _obj_getMethodArgWithFullPath(obj, methodPath, NULL);
+}
+
+Arg* obj_getMethodArgWithFullPath_noalloc(PikaObj* obj,
+                                          char* methodPath,
+                                          Arg* arg_reg) {
+    return _obj_getMethodArgWithFullPath(obj, methodPath, arg_reg);
+}
+
+Arg* obj_getMethodArg(PikaObj* obj, char* methodName) {
+    return _obj_getMethodArg(obj, methodName, NULL);
+}
+
+Arg* obj_getMethodArg_noalloc(PikaObj* obj, char* methodName, Arg* arg_reg) {
+    return _obj_getMethodArg(obj, methodName, arg_reg);
 }
 
 NewFun obj_getClass(PikaObj* obj) {
@@ -460,7 +644,7 @@ PikaObj* obj_getClassObj(PikaObj* obj) {
     if (NULL == classPtr) {
         return NULL;
     }
-    PikaObj* classObj = obj_getClassObjByNewFun(obj, "", classPtr);
+    PikaObj* classObj = obj_newObjFromConstructor(obj, "", classPtr);
     return classObj;
 }
 
@@ -480,8 +664,7 @@ PikaObj* removeMethodInfo(PikaObj* thisClass) {
 }
 
 PikaObj* newNormalObj(NewFun newObjFun) {
-    PikaObj* thisClass = obj_getClassObjByNewFun(NULL, "", newObjFun);
-    obj_refcntInc(thisClass);
+    PikaObj* thisClass = obj_newObjFromConstructor(NULL, "", newObjFun);
     obj_setFlag(thisClass, OBJ_FLAG_ALREADY_INIT);
     return removeMethodInfo(thisClass);
 }
@@ -517,14 +700,57 @@ static int set_disp_mode(int fd, int option) {
 
 static volatile uint8_t logo_printed = 0;
 
+#if __linux
+struct termios original_termios;
+
+static void enable_raw_mode(void) {
+    struct termios raw;
+
+    tcgetattr(STDIN_FILENO, &original_termios);  // 获取当前终端属性
+    raw = original_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);           // 禁用回显和规范模式
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);  // 设置终端属性
+}
+
+static void disable_raw_mode(void) {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);  // 恢复原始终端属性
+    printf("\n");
+}
+
+static void signal_handler(int sig) {
+    if (sig == SIGSEGV) {
+        printf("Segmentation fault");
+    } else if (sig == SIGINT) {
+        printf("Ctrl+C");
+    } else if (sig == SIGTERM) {
+        printf("SIGTERM");
+    } else if (sig == SIGHUP) {
+        printf("SIGHUP");
+    } else if (sig == SIGABRT) {
+        printf("Aborted");
+    }
+    disable_raw_mode();
+    exit(1);
+}
+
+#endif
+
 extern volatile PikaObj* __pikaMain;
 PikaObj* newRootObj(char* name, NewFun newObjFun) {
-    in_root_obj = PIKA_TRUE;
+    g_PikaObjState.inRootObj = pika_true;
 #if PIKA_POOL_ENABLE
     mem_pool_init();
 #endif
-#if __linux
-    // set_disp_mode(STDIN_FILENO, 0);
+#ifdef __linux
+    signal(SIGINT, signal_handler);   // 捕获 SIGINT 信号（Ctrl+C）
+    signal(SIGTERM, signal_handler);  // 捕获 SIGTERM 信号
+    signal(SIGHUP, signal_handler);   // 捕获 SIGHUP 信号
+    signal(SIGSEGV, signal_handler);  // 捕获 SIGHUP 信号
+    signal(SIGABRT, signal_handler);
+    signal(SIGQUIT, signal_handler);
+    signal(SIGTRAP, signal_handler);
+    signal(SIGHUP, signal_handler);
+    enable_raw_mode();
 #endif
     PikaObj* newObj = newNormalObj(newObjFun);
     if (!logo_printed) {
@@ -534,8 +760,14 @@ PikaObj* newRootObj(char* name, NewFun newObjFun) {
         pika_platform_printf("~  pikascript.com  ~\r\n");
         pika_platform_printf("~~~~~~~~~~~~~~~~~~~~\r\n");
     }
+    if (NULL != __pikaMain) {
+        pika_platform_printf("Error: root object already exists\r\n");
+        pika_platform_panic_handle();
+        return NULL;
+    }
     __pikaMain = newObj;
-    in_root_obj = PIKA_FALSE;
+    obj_setName(newObj, name);
+    g_PikaObjState.inRootObj = pika_false;
     return newObj;
 }
 
@@ -556,34 +788,35 @@ Arg* obj_newObjInPackage(NewFun new_obj_fun) {
     return arg_newDirectObj(new_obj_fun);
 }
 
-static PikaObj* __obj_initSubObj(PikaObj* obj, char* name) {
+static PikaObj* _obj_initMetaObj(PikaObj* obj, char* name) {
     PikaObj* res = NULL;
     NewFun constructor = (NewFun)getNewClassObjFunByName(obj, name);
     Args buffs = {0};
     PikaObj* thisClass;
-    PikaObj* new_obj;
+    PikaObj* oNew;
     if (NULL == constructor) {
         /* no such object */
         res = NULL;
         goto exit;
     }
-    thisClass = obj_getClassObjByNewFun(obj, name, constructor);
-    new_obj = removeMethodInfo(thisClass);
-    obj_refcntInc(new_obj);
-    obj_runNativeMethod(new_obj, "__init__", NULL);
-    args_setPtrWithType(obj->list, name, ARG_TYPE_OBJECT, new_obj);
+    thisClass = obj_newObjFromConstructor(obj, name, constructor);
+    oNew = removeMethodInfo(thisClass);
+    obj_setName(oNew, name);
+    obj_runNativeMethod(oNew, "__init__", NULL);
+    args_setPtrWithType(obj->list, name, ARG_TYPE_OBJECT, oNew);
     res = obj_getPtr(obj, name);
+    // pikaGC_enable(res);
     goto exit;
 exit:
     strsDeinit(&buffs);
     return res;
 }
 
-PikaObj* _arg_to_obj(Arg* self, PIKA_BOOL* pIsTemp) {
+PikaObj* _arg_to_obj(Arg* self, pika_bool* pIsTemp) {
     if (NULL == self) {
         return NULL;
     }
-    if (argType_isObject(arg_getType(self))) {
+    if (arg_isObject(self)) {
         return arg_getPtr(self);
     }
 #if !PIKA_NANO_ENABLE
@@ -592,7 +825,7 @@ PikaObj* _arg_to_obj(Arg* self, PIKA_BOOL* pIsTemp) {
         PikaObj* obj = newNormalObj(New_PikaStdData_String);
         obj_setStr(obj, "str", arg_getStr(self));
         if (NULL != pIsTemp) {
-            *pIsTemp = PIKA_TRUE;
+            *pIsTemp = pika_true;
         }
         return obj;
     }
@@ -601,7 +834,7 @@ PikaObj* _arg_to_obj(Arg* self, PIKA_BOOL* pIsTemp) {
         PikaObj* obj = newNormalObj(New_PikaStdData_ByteArray);
         obj_setArg(obj, "raw", self);
         if (NULL != pIsTemp) {
-            *pIsTemp = PIKA_TRUE;
+            *pIsTemp = pika_true;
         }
         return obj;
     }
@@ -609,10 +842,10 @@ PikaObj* _arg_to_obj(Arg* self, PIKA_BOOL* pIsTemp) {
     return NULL;
 }
 
-static PikaObj* __obj_getObjDirect(PikaObj* self,
-                                   char* name,
-                                   PIKA_BOOL* pIsTemp) {
-    *pIsTemp = PIKA_FALSE;
+static PikaObj* _obj_getObjDirect(PikaObj* self,
+                                  char* name,
+                                  pika_bool* pIsTemp) {
+    *pIsTemp = pika_false;
     if (NULL == self) {
         return NULL;
     }
@@ -620,7 +853,7 @@ static PikaObj* __obj_getObjDirect(PikaObj* self,
     Arg* arg_obj = args_getArg(self->list, name);
     ArgType type = ARG_TYPE_NONE;
     if (NULL == arg_obj) {
-        arg_obj = _obj_getProp(self, name);
+        arg_obj = _obj_getPropArg(self, name);
     }
     if (NULL == arg_obj) {
         return NULL;
@@ -628,7 +861,7 @@ static PikaObj* __obj_getObjDirect(PikaObj* self,
     type = arg_getType(arg_obj);
     /* found meta Object */
     if (type == ARG_TYPE_OBJECT_META) {
-        return __obj_initSubObj(self, name);
+        return _obj_initMetaObj(self, name);
     }
     /* found Objcet */
     if (argType_isObject(type)) {
@@ -638,7 +871,7 @@ static PikaObj* __obj_getObjDirect(PikaObj* self,
     /* found class */
     if (type == ARG_TYPE_METHOD_NATIVE_CONSTRUCTOR ||
         type == ARG_TYPE_METHOD_CONSTRUCTOR) {
-        *pIsTemp = PIKA_TRUE;
+        *pIsTemp = pika_true;
         PikaObj* method_args_obj = New_TinyObj(NULL);
         Arg* cls_obj_arg = obj_runMethodArg(self, method_args_obj, arg_obj);
         obj_deinit(method_args_obj);
@@ -653,46 +886,73 @@ static PikaObj* __obj_getObjDirect(PikaObj* self,
     return _arg_to_obj(arg_obj, pIsTemp);
 }
 
-static PikaObj* __obj_getObjWithKeepDeepth(PikaObj* self,
-                                           char* objPath,
-                                           PIKA_BOOL* pIsTemp,
-                                           int32_t keepDeepth) {
+static PikaObj* _obj_getObjWithKeepDeepth(PikaObj* self,
+                                          char* objPath,
+                                          pika_bool* pIsTemp,
+                                          int32_t keepDeepth) {
     char objPath_buff[PIKA_PATH_BUFF_SIZE];
     char* objPath_ptr = objPath_buff;
+    pika_assert(NULL != objPath);
+    if ('.' == objPath[0] && '\0' == objPath[1]) {
+        return self;
+    }
     strcpy(objPath_buff, objPath);
     int32_t token_num = strGetTokenNum(objPath, '.');
     PikaObj* obj = self;
     for (int32_t i = 0; i < token_num - keepDeepth; i++) {
         char* token = strPopFirstToken(&objPath_ptr, '.');
-        obj = __obj_getObjDirect(obj, token, pIsTemp);
+        obj = _obj_getObjDirect(obj, token, pIsTemp);
         if (obj == NULL) {
             goto exit;
         }
     }
     goto exit;
 exit:
+    if (NULL != obj) {
+        pika_assert(obj_checkAlive(obj));
+    }
     return obj;
 }
 
 PikaObj* obj_getObj(PikaObj* self, char* objPath) {
-    PIKA_BOOL is_temp = PIKA_FALSE;
-    return __obj_getObjWithKeepDeepth(self, objPath, &is_temp, 0);
+    pika_assert(NULL != objPath);
+    pika_bool is_temp = pika_false;
+    return _obj_getObjWithKeepDeepth(self, objPath, &is_temp, 0);
 }
 
 PikaObj* obj_getHostObj(PikaObj* self, char* objPath) {
-    PIKA_BOOL is_temp = PIKA_FALSE;
-    return __obj_getObjWithKeepDeepth(self, objPath, &is_temp, 1);
+    pika_assert(NULL != objPath);
+    pika_bool is_temp = pika_false;
+    return _obj_getObjWithKeepDeepth(self, objPath, &is_temp, 1);
 }
 
 PikaObj* obj_getHostObjWithIsTemp(PikaObj* self,
                                   char* objPath,
-                                  PIKA_BOOL* pIsTemp) {
-    return __obj_getObjWithKeepDeepth(self, objPath, pIsTemp, 1);
+                                  pika_bool* pIsTemp) {
+    return _obj_getObjWithKeepDeepth(self, objPath, pIsTemp, 1);
 }
 
 Method methodArg_getPtr(Arg* method_arg) {
     MethodProp* method_store = (MethodProp*)arg_getContent(method_arg);
     return (Method)method_store->ptr;
+}
+
+Arg* _get_return_arg(PikaObj* locals);
+NativeProperty* methodArg_toProp(Arg* method_arg) {
+    pika_assert(arg_getType(method_arg) == ARG_TYPE_METHOD_NATIVE_CONSTRUCTOR);
+    PikaObj* locals = New_TinyObj(NULL);
+    MethodProp* method_store = (MethodProp*)arg_getContent(method_arg);
+    Method fMethod = (Method)method_store->ptr;
+    fMethod(NULL, locals->list);
+    Arg* aReturn = _get_return_arg(locals);
+    if (arg_getType(aReturn) == ARG_TYPE_OBJECT_NEW) {
+        arg_setType(aReturn, ARG_TYPE_OBJECT);
+    }
+    PikaObj* obj = arg_getPtr(aReturn);
+    NativeProperty* prop = obj_getProp(obj);
+    arg_deinit(aReturn);
+    obj_deinit(locals);
+    return prop;
 }
 
 char* methodArg_getTypeList(Arg* method_arg, char* buffs, size_t size) {
@@ -719,6 +979,9 @@ PikaObj* methodArg_getHostObj(Arg* method_arg) {
 }
 
 int methodArg_setHostObj(Arg* method_arg, PikaObj* host_obj) {
+    if (arg_getType(method_arg) != ARG_TYPE_METHOD_OBJECT) {
+        return -1;
+    }
     MethodProp* prop = (MethodProp*)arg_getContent(method_arg);
     if (prop->host_obj == NULL) {
         prop->host_obj = host_obj;
@@ -739,8 +1002,53 @@ char* methodArg_getName(Arg* method_arg, char* buffs, size_t size) {
     return res;
 }
 
+char* _find_super_class_name(ByteCodeFrame* bcframe, int32_t pc_start);
+Arg* _builtin_class(char* sRunPath);
+Arg* methodArg_super(Arg* aThis, NativeProperty** p_prop) {
+    Arg* aSuper = NULL;
+    PikaObj* builtins = NULL;
+    ArgType type = arg_getType(aThis);
+    *p_prop = NULL;
+    if (!argType_isConstructor(type)) {
+        aSuper = NULL;
+        goto __exit;
+    }
+    if (type == ARG_TYPE_METHOD_CONSTRUCTOR) {
+        builtins = obj_getBuiltins();
+        MethodProp* method_store = (MethodProp*)arg_getContent(aThis);
+        ByteCodeFrame* bcframe = method_store->bytecode_frame;
+        int32_t pc = method_store->ptr - bcframe->instruct_array.content_start;
+        char* sSuper = _find_super_class_name(bcframe, pc);
+        /* map TinyObj to object */
+        if (strEqu(sSuper, "TinyObj")) {
+            sSuper = "object";
+        }
+        PikaObj* context = method_store->def_context;
+        aSuper = obj_getMethodArgWithFullPath(context, sSuper);
+        if (NULL == aSuper) {
+            aSuper = obj_getMethodArgWithFullPath(builtins, sSuper);
+        }
+        goto __exit;
+    }
+    if (type == ARG_TYPE_METHOD_NATIVE_CONSTRUCTOR) {
+        NativeProperty* prop = methodArg_toProp(aThis);
+        *p_prop = prop;
+        arg_deinit(aThis);
+        aSuper = NULL;
+        goto __exit;
+    }
+__exit:
+    if (NULL != builtins) {
+        obj_deinit(builtins);
+    }
+    if (NULL != aSuper) {
+        arg_deinit(aThis);
+    }
+    return aSuper;
+}
+
 Method obj_getNativeMethod(PikaObj* self, char* method_name) {
-    Arg* method_arg = obj_getMethodArg(self, method_name);
+    Arg* method_arg = obj_getMethodArgWithFullPath(self, method_name);
     if (NULL == method_arg) {
         return NULL;
     }
@@ -789,30 +1097,36 @@ void _update_proxy(PikaObj* self, char* name) {
             return;
         }
     }
+    if (!obj_getFlag(self, OBJ_FLAG_PROXY_METHOD)) {
+        if (strEqu(name, "__proxy__")) {
+            obj_setFlag(self, OBJ_FLAG_PROXY_METHOD);
+            return;
+        }
+    }
 }
 
-static void obj_saveMethodInfo(PikaObj* self, MethodInfo* method_info) {
-    Arg* arg = New_arg(NULL);
-    MethodProp method_store = {
-        .ptr = method_info->ptr,
-        .type_list = method_info->typelist,
-        .name = method_info->name,
-        .bytecode_frame = method_info->bytecode_frame,
-        .def_context = method_info->def_context,
-        .declareation = method_info->dec,  // const
+static void obj_saveMethodInfo(PikaObj* self, MethodInfo* tInfo) {
+    Arg* aMethod = New_arg(NULL);
+    MethodProp tProp = {
+        .ptr = tInfo->ptr,
+        .type_list = tInfo->typelist,
+        .name = tInfo->name,
+        .bytecode_frame = tInfo->bytecode_frame,
+        .def_context = tInfo->def_context,
+        .declareation = tInfo->dec,  // const
         .host_obj = NULL,
     };
-    char* name = method_info->name;
-    if (NULL == method_info->name) {
+    char* name = tInfo->name;
+    if (NULL == tInfo->name) {
         char name_buff[PIKA_LINE_BUFF_SIZE / 2] = {0};
-        name = strGetFirstToken(name_buff, method_info->dec, '(');
+        name = strGetFirstToken(name_buff, tInfo->dec, '(');
     }
     /* the first arg_value */
-    arg = arg_setStruct(arg, name, &method_store, sizeof(method_store));
-    pika_assert(NULL != arg);
-    arg_setType(arg, method_info->type);
+    aMethod = arg_setStruct(aMethod, name, &tProp, sizeof(tProp));
+    pika_assert(NULL != aMethod);
+    arg_setType(aMethod, tInfo->type);
     _update_proxy(self, name);
-    args_setArg(self->list, arg);
+    args_setArg(self->list, aMethod);
 }
 
 static int32_t __class_defineMethodWithType(PikaObj* self,
@@ -921,16 +1235,15 @@ exit:
     return err;
 }
 
-int32_t obj_isArgExist(PikaObj* self, char* argPath) {
+pika_bool obj_isArgExist(PikaObj* self, char* argPath) {
+    if (NULL == argPath) {
+        return 0;
+    }
     PikaObj* obj_host = obj_getHostObj(self, argPath);
     int32_t res = 0;
     char* argName;
     Arg* arg;
-    if (NULL == obj_host) {
-        /* [error] object no found */
-        res = 1;
-        goto exit;
-    }
+    pika_assert(NULL != obj_host);
     argName = strPointToLastToken(argPath, '.');
     arg = args_getArg(obj_host->list, argName);
     if (NULL == arg) {
@@ -944,6 +1257,15 @@ int32_t obj_isArgExist(PikaObj* self, char* argPath) {
 
 exit:
     return res;
+}
+
+pika_bool obj_isMethodExist(PikaObj* self, char* method) {
+    Arg* arg = obj_getMethodArg(self, method);
+    if (NULL == arg) {
+        return pika_false;
+    }
+    arg_deinit(arg);
+    return pika_true;
 }
 
 VMParameters* obj_run(PikaObj* self, char* cmd) {
@@ -973,7 +1295,7 @@ enum PIKA_SHELL_STATE {
 
 static void _obj_runChar_beforeRun(PikaObj* self, ShellConfig* shell) {
     /* create the line buff for the first time */
-    shell->inBlock = PIKA_FALSE;
+    shell->inBlock = pika_false;
     shell->stat = PIKA_SHELL_STATE_NORMAL;
     shell->line_position = 0;
     shell->line_curpos = 0;
@@ -996,18 +1318,18 @@ typedef enum {
     __FILTER_SUCCESS_DROP_ALL_PEEKED
 } FilterReturn;
 
-PIKA_BOOL _filter_msg_hi_pika_handler(FilterItem* msg,
+pika_bool _filter_msg_hi_pika_handler(FilterItem* msg,
                                       PikaObj* self,
                                       ShellConfig* shell) {
     pika_platform_printf("Yes, I am here\r\n");
-    return PIKA_TRUE;
+    return pika_true;
 }
 
-PIKA_BOOL _filter_msg_bye_pika_handler(FilterItem* msg,
+pika_bool _filter_msg_bye_pika_handler(FilterItem* msg,
                                        PikaObj* self,
                                        ShellConfig* shell) {
     pika_platform_printf("OK, see you\r\n");
-    return PIKA_TRUE;
+    return pika_true;
 }
 
 #define __MSG_DECLARE
@@ -1153,42 +1475,159 @@ int16_t _do_stream_filter(PikaObj* self, ShellConfig* shell) {
 }
 #endif
 
+#if PIKA_SHELL_HISTORY_ENABLE
+ShellHistory* shHistory_create(int max_size) {
+    ShellHistory* self = (ShellHistory*)pikaMalloc(sizeof(ShellHistory));
+    self->max_size = max_size;
+    self->current = -1;
+    self->count = 0;
+    self->last_offset = 0;
+    self->cached_current = 0;
+    self->history = (char**)pikaMalloc(max_size * sizeof(char*));
+    return self;
+}
+
+void shHistory_destroy(ShellHistory* self) {
+    for (int i = 0; i < self->count; i++) {
+        pikaFree(self->history[i], strGetSize(self->history[i]) + 1);
+    }
+    pikaFree(self->history, sizeof(char*) * self->max_size);
+    pikaFree(self, sizeof(ShellHistory));
+}
+
+void shHistory_add(ShellHistory* self, char* command) {
+    if (self->count == self->max_size) {
+        pikaFree(self->history[0], strGetSize(self->history[0]) + 1);
+        pika_platform_memmove(self->history, self->history + 1,
+                              (self->max_size - 1) * sizeof(char*));
+        self->count--;
+    }
+
+    /* filter for empty command */
+    if (self->count > 0 && self->history[self->count - 1][0] == '\0') {
+        pikaFree(self->history[self->count - 1],
+                 strGetSize(self->history[self->count - 1]) + 1);
+        self->count--;
+    }
+
+    /* filter for same command */
+    if (self->count > 0 && strEqu(self->history[self->count - 1], command)) {
+        return;
+    }
+
+    self->history[self->count] = pikaMalloc(strGetSize(command) + 1);
+    pika_platform_memcpy(self->history[self->count], command,
+                         strGetSize(command) + 1);
+    self->count++;
+    self->current = self->count - 1;
+    self->last_offset = 0;
+}
+
+char* shHistory_get(ShellHistory* self, int offset) {
+    int actual_offset = offset + self->last_offset;
+    int index = self->current + actual_offset;
+    if (index < 0 || index >= self->count) {
+        return NULL;
+    }
+    self->last_offset = actual_offset;
+    return self->history[index];
+}
+
+char* shHistory_getPrev(ShellHistory* self) {
+    return shHistory_get(self, -1);
+}
+
+char* shHistory_getNext(ShellHistory* self) {
+    return shHistory_get(self, 1);
+}
+
+#endif
+
+#if __linux
+#define PIKA_BACKSPACE() printf("\b \b")
+#else
+#define PIKA_BACKSPACE() pika_platform_printf(" \b")
+#endif
+
+#if __linux
+#define PIKA_BACKSPACE_FORCE() printf("\b \b")
+#else
+#define PIKA_BACKSPACE_FORCE() pika_platform_printf("\b \b")
+#endif
+
+static void handle_history_navigation(char inputChar,
+                                      ShellConfig* shell,
+                                      pika_bool bIsUp) {
+#if PIKA_SHELL_HISTORY_ENABLE
+    if (NULL == shell->history) {
+        shell->history = shHistory_create(PIKA_SHELL_HISTORY_NUM);
+    }
+    if (0 == shell->history->cached_current) {
+        /* save the current line */
+        shHistory_add(shell->history, shell->lineBuff);
+        shell->history->cached_current = 1;
+    }
+    char* history_line = bIsUp ? shHistory_getPrev(shell->history)
+                               : shHistory_getNext(shell->history);
+    if (NULL == history_line) {
+        return;
+    }
+    /* move to the last position */
+    for (int i = 0; i < shell->line_position - shell->line_curpos; i++) {
+        _putc_cmd(PIKA_KEY_RIGHT, 1);
+    }
+    /* clear the current line */
+    for (int i = 0; i < shell->line_position; i++) {
+        PIKA_BACKSPACE_FORCE();
+    }
+    pika_platform_memcpy(shell->lineBuff, history_line,
+                         strGetSize(history_line) + 1);
+    /* show the previous line */
+    pika_platform_printf("%s", shell->lineBuff);
+    shell->line_position = strGetSize(history_line);
+    shell->line_curpos = shell->line_position;
+#endif
+    return;
+}
+
 enum shellCTRL _inner_do_obj_runChar(PikaObj* self,
                                      char inputChar,
                                      ShellConfig* shell) {
     char* input_line = NULL;
     enum shellCTRL ctrl = SHELL_CTRL_CONTINUE;
-#if !(defined(__linux) || defined(_WIN32))
+#if __linux
+    printf("%c", inputChar);
+#elif !(defined(_WIN32))
     pika_platform_printf("%c", inputChar);
 #endif
     if (inputChar == '\n' && shell->lastChar == '\r') {
         ctrl = SHELL_CTRL_CONTINUE;
-        goto exit;
+        goto __exit;
     }
     if (inputChar == 0x1b) {
         shell->stat = PIKA_SHELL_STATE_WAIT_SPEC_KEY;
         ctrl = SHELL_CTRL_CONTINUE;
-        goto exit;
+        goto __exit;
     }
     if (shell->stat == PIKA_SHELL_STATE_WAIT_SPEC_KEY) {
         if (inputChar == 0x5b) {
             shell->stat = PIKA_SHELL_STATE_WAIT_FUNC_KEY;
             ctrl = SHELL_CTRL_CONTINUE;
-            goto exit;
+            goto __exit;
         }
         shell->stat = PIKA_SHELL_STATE_NORMAL;
     }
     if (shell->stat == PIKA_SHELL_STATE_WAIT_FUNC_KEY) {
-        if (inputChar == KEY_LEFT) {
+        if (inputChar == PIKA_KEY_LEFT) {
             if (shell->line_curpos) {
                 shell->line_curpos--;
             } else {
                 pika_platform_printf(" ");
             }
             ctrl = SHELL_CTRL_CONTINUE;
-            goto exit;
+            goto __exit;
         }
-        if (inputChar == KEY_RIGHT) {
+        if (inputChar == PIKA_KEY_RIGHT) {
             if (shell->line_curpos < shell->line_position) {
                 // pika_platform_printf("%c",
                 // shell->lineBuff[shell->line_curpos]);
@@ -1197,25 +1636,31 @@ enum shellCTRL _inner_do_obj_runChar(PikaObj* self,
                 pika_platform_printf("\b");
             }
             ctrl = SHELL_CTRL_CONTINUE;
-            goto exit;
+            goto __exit;
         }
-        if (inputChar == KEY_UP) {
-            _putc_cmd(KEY_DOWN, 1);
+        if (inputChar == PIKA_KEY_UP) {
+            _putc_cmd(PIKA_KEY_DOWN, 1);
             ctrl = SHELL_CTRL_CONTINUE;
-            goto exit;
+            handle_history_navigation(inputChar, shell, pika_true);
+            goto __exit;
         }
-        if (inputChar == KEY_DOWN) {
+        if (inputChar == PIKA_KEY_DOWN) {
             ctrl = SHELL_CTRL_CONTINUE;
-            goto exit;
+            handle_history_navigation(inputChar, shell, pika_false);
+            goto __exit;
         }
     }
     if ((inputChar == '\b') || (inputChar == 127)) {
-        if (shell->line_position == 0) {
+        if (shell->line_curpos == 0) {
+#if __linux
+            printf("\b ");
+#else
             pika_platform_printf(" ");
+#endif
             ctrl = SHELL_CTRL_CONTINUE;
-            goto exit;
+            goto __exit;
         }
-        pika_platform_printf(" \b");
+        PIKA_BACKSPACE();
         shell->line_position--;
         shell->line_curpos--;
         pika_platform_memmove(shell->lineBuff + shell->line_curpos,
@@ -1226,10 +1671,11 @@ enum shellCTRL _inner_do_obj_runChar(PikaObj* self,
             /* update screen */
             pika_platform_printf(shell->lineBuff + shell->line_curpos);
             pika_platform_printf(" ");
-            _putc_cmd(KEY_LEFT, shell->line_position - shell->line_curpos + 1);
+            _putc_cmd(PIKA_KEY_LEFT,
+                      shell->line_position - shell->line_curpos + 1);
         }
         ctrl = SHELL_CTRL_CONTINUE;
-        goto exit;
+        goto __exit;
     }
     if ((inputChar != '\r') && (inputChar != '\n')) {
         if (shell->line_position + 1 >= PIKA_LINE_BUFF_SIZE) {
@@ -1238,7 +1684,7 @@ enum shellCTRL _inner_do_obj_runChar(PikaObj* self,
                 "'PIKA_LINE_BUFF_SIZE'\r\n");
             ctrl = SHELL_CTRL_EXIT;
             __clearBuff(shell);
-            goto exit;
+            goto __exit;
         }
         if ('\0' != inputChar) {
             pika_platform_memmove(shell->lineBuff + shell->line_curpos + 1,
@@ -1247,18 +1693,29 @@ enum shellCTRL _inner_do_obj_runChar(PikaObj* self,
             shell->lineBuff[shell->line_position + 1] = 0;
             if (shell->line_curpos != shell->line_position) {
                 pika_platform_printf(shell->lineBuff + shell->line_curpos + 1);
-                _putc_cmd(KEY_LEFT, shell->line_position - shell->line_curpos);
+                _putc_cmd(PIKA_KEY_LEFT,
+                          shell->line_position - shell->line_curpos);
             }
             shell->lineBuff[shell->line_curpos] = inputChar;
             shell->line_position++;
             shell->line_curpos++;
         }
         ctrl = SHELL_CTRL_CONTINUE;
-        goto exit;
+        goto __exit;
     }
     if ((inputChar == '\r') || (inputChar == '\n')) {
 #if !(defined(__linux) || defined(_WIN32) || PIKA_SHELL_NO_NEWLINE)
         pika_platform_printf("\r\n");
+#endif
+#if PIKA_SHELL_HISTORY_ENABLE
+        if (NULL == shell->history) {
+            shell->history = shHistory_create(PIKA_SHELL_HISTORY_NUM);
+        }
+        if (shell->lineBuff[0] != '\0') {
+            shHistory_add(shell->history, shell->lineBuff);
+        }
+        shell->history->last_offset = 0;
+        shell->history->cached_current = 0;
 #endif
         /* still in block */
         if (shell->blockBuffName != NULL && shell->inBlock) {
@@ -1273,39 +1730,39 @@ enum shellCTRL _inner_do_obj_runChar(PikaObj* self,
             strsDeinit(&buffs);
             /* go out from block */
             if ((shell->lineBuff[0] != ' ') && (shell->lineBuff[0] != '\t')) {
-                shell->inBlock = PIKA_FALSE;
+                shell->inBlock = pika_false;
                 input_line = obj_getStr(self, shell->blockBuffName);
                 ctrl = shell->handler(self, input_line, shell);
                 __clearBuff(shell);
                 pika_platform_printf(">>> ");
-                goto exit;
+                goto __exit;
             } else {
                 pika_platform_printf("... ");
             }
             __clearBuff(shell);
             ctrl = SHELL_CTRL_CONTINUE;
-            goto exit;
+            goto __exit;
         }
         /* go in block */
         if (shell->blockBuffName != NULL && 0 != strGetSize(shell->lineBuff)) {
             if (shell->lineBuff[strGetSize(shell->lineBuff) - 1] == ':') {
-                shell->inBlock = PIKA_TRUE;
+                shell->inBlock = pika_true;
                 char _n = '\n';
                 strAppendWithSize(shell->lineBuff, &_n, 1);
                 obj_setStr(self, shell->blockBuffName, shell->lineBuff);
                 __clearBuff(shell);
                 pika_platform_printf("... ");
                 ctrl = SHELL_CTRL_CONTINUE;
-                goto exit;
+                goto __exit;
             }
         }
         shell->lineBuff[shell->line_position] = '\0';
         ctrl = shell->handler(self, shell->lineBuff, shell);
         pika_platform_printf("%s", shell->prefix);
         __clearBuff(shell);
-        goto exit;
+        goto __exit;
     }
-exit:
+__exit:
     shell->lastChar = inputChar;
     return ctrl;
 }
@@ -1321,11 +1778,11 @@ enum shellCTRL _do_obj_runChar(PikaObj* self,
     if (NULL == queue->buffer) {
         /* need initialize first */
         byteQueue_init(queue, &shell->filter_fifo.buffer,
-                       sizeof(shell->filter_fifo.buffer), PIKA_FALSE);
+                       sizeof(shell->filter_fifo.buffer), pika_false);
     }
 
-    PIKA_BOOL result = byteQueue_writeOne(queue, inputChar);
-    pika_assert(result != PIKA_FALSE);
+    pika_bool result = byteQueue_writeOne(queue, inputChar);
+    pika_assert(result != pika_false);
 
     int16_t byte_count;
     do {
@@ -1336,8 +1793,8 @@ enum shellCTRL _do_obj_runChar(PikaObj* self,
         int16_t n = byte_count;
 
         while (n--) {
-            PIKA_BOOL result = byteQueue_readOne(queue, (uint8_t*)&inputChar);
-            pika_assert(result != PIKA_FALSE);
+            result = byteQueue_readOne(queue, (uint8_t*)&inputChar);
+            pika_assert(pika_false != result);
 
             if (SHELL_CTRL_EXIT ==
                 _inner_do_obj_runChar(self, inputChar, shell)) {
@@ -1353,16 +1810,15 @@ enum shellCTRL _do_obj_runChar(PikaObj* self,
 }
 
 enum shellCTRL obj_runChar(PikaObj* self, char inputChar) {
-    ShellConfig* shell = args_getStruct(self->list, "@shcfg");
+    ShellConfig* shell = args_getHeapStruct(self->list, "@shcfg");
     if (NULL == shell) {
         /* init the shell */
-        ShellConfig newShell = {
-            .prefix = ">>> ",
-            .blockBuffName = "@sh1",
-            .handler = __obj_shellLineHandler_REPL,
-        };
-        args_setStruct(self->list, "@shcfg", newShell);
-        shell = args_getStruct(self->list, "@shcfg");
+        ShellConfig newShell = {0};
+        newShell.prefix = ">>> ";
+        newShell.blockBuffName = "@sh1";
+        newShell.handler = __obj_shellLineHandler_REPL;
+        args_setHeapStruct(self->list, "@shcfg", newShell, shConfig_deinit);
+        shell = args_getHeapStruct(self->list, "@shcfg");
         _obj_runChar_beforeRun(self, shell);
     }
     return _do_obj_runChar(self, inputChar, shell);
@@ -1384,6 +1840,13 @@ static void _save_file(char* file_name, uint8_t* buff, size_t size) {
     }
 }
 
+char _await_getchar(sh_getchar fn_getchar) {
+    pika_GIL_EXIT();
+    char ret = fn_getchar();
+    pika_GIL_ENTER();
+    return ret;
+}
+
 void _do_pikaScriptShell(PikaObj* self, ShellConfig* cfg) {
     /* init the shell */
     _obj_runChar_beforeRun(self, cfg);
@@ -1392,7 +1855,7 @@ void _do_pikaScriptShell(PikaObj* self, ShellConfig* cfg) {
     char inputChar[2] = {0};
     while (1) {
         inputChar[1] = inputChar[0];
-        inputChar[0] = cfg->fn_getchar();
+        inputChar[0] = _await_getchar(cfg->fn_getchar);
 #if !PIKA_NANO_ENABLE
         /* run python script */
         if (inputChar[0] == '!' && inputChar[1] == '#') {
@@ -1401,8 +1864,8 @@ void _do_pikaScriptShell(PikaObj* self, ShellConfig* cfg) {
             char* buff = pikaMalloc(PIKA_READ_FILE_BUFF_SIZE);
             char input[2] = {0};
             int buff_i = 0;
-            PIKA_BOOL is_exit = PIKA_FALSE;
-            PIKA_BOOL is_first_line = PIKA_TRUE;
+            pika_bool is_exit = pika_false;
+            pika_bool is_first_line = pika_true;
             while (1) {
                 input[1] = input[0];
                 input[0] = cfg->fn_getchar();
@@ -1419,7 +1882,7 @@ void _do_pikaScriptShell(PikaObj* self, ShellConfig* cfg) {
                 }
                 if (is_first_line) {
                     if ('\n' == input[0]) {
-                        is_first_line = PIKA_FALSE;
+                        is_first_line = pika_false;
                     }
                     continue;
                 }
@@ -1451,7 +1914,7 @@ void _do_pikaScriptShell(PikaObj* self, ShellConfig* cfg) {
             pika_platform_printf("=============== [ Run] ===============\r\n");
             obj_run(self, (char*)buff);
             if (NULL != strstr(buff, "exit()")) {
-                is_exit = PIKA_TRUE;
+                is_exit = pika_true;
             }
             pikaFree(buff, PIKA_READ_FILE_BUFF_SIZE);
             if (is_exit) {
@@ -1540,11 +2003,24 @@ static volatile ShellConfig g_repl_shell = {
     .handler = __obj_shellLineHandler_REPL,
     .prefix = ">>> ",
     .blockBuffName = "@sh0",
+#if PIKA_SHELL_HISTORY_ENABLE
+    .history = NULL,
+#endif
 };
 
 void pikaScriptShell_withGetchar(PikaObj* self, sh_getchar getchar_fn) {
     g_repl_shell.fn_getchar = getchar_fn;
     _do_pikaScriptShell(self, (ShellConfig*)&g_repl_shell);
+}
+
+int shConfig_deinit(ShellConfig* self) {
+#if PIKA_SHELL_HISTORY_ENABLE
+    if (NULL != self->history) {
+        shHistory_destroy(self->history);
+        self->history = NULL;
+    }
+#endif
+    return 0;
 }
 
 void pikaScriptShell(PikaObj* self) {
@@ -1600,7 +2076,7 @@ void method_returnInt(Args* args, int64_t val) {
     args_pushArg_name(args, "@rt", arg_newInt(val));
 }
 
-void method_returnBool(Args* args, PIKA_BOOL val) {
+void method_returnBool(Args* args, pika_bool val) {
     if (val == _PIKA_BOOL_ERR) {
         return;
     }
@@ -1617,7 +2093,7 @@ void method_returnPtr(Args* args, void* val) {
 
 void method_returnObj(Args* args, void* val) {
     if (NULL == val) {
-        args_pushArg_name(args, "@rt", arg_newNull());
+        args_pushArg_name(args, "@rt", arg_newNone());
         return;
     }
     ArgType type;
@@ -1646,13 +2122,345 @@ char* method_getStr(Args* args, char* argName) {
     return args_getStr(args, argName);
 }
 
+#if PIKA_GC_MARK_SWEEP_ENABLE
+PikaObj* pikaGC_getLast(PikaObj* self) {
+    PikaObj* obj = g_PikaObjState.gcChain;
+    PikaObj* last = NULL;
+    while (NULL != obj) {
+        if (obj == self) {
+            return last;
+        }
+        last = obj;
+        obj = obj->gcNext;
+    }
+    return NULL;
+}
+
+void pikaGC_clean(PikaGC* gc) {
+    PikaObj* obj = g_PikaObjState.gcChain;
+    while (NULL != obj) {
+        obj_clearFlag(obj, OBJ_FLAG_GC_MARKED);
+        // obj->gcRoot = NULL;
+        obj = obj->gcNext;
+    }
+}
+
+uint32_t pikaGC_count(void) {
+    uint32_t count = 0;
+    PikaObj* obj = g_PikaObjState.gcChain;
+    while (NULL != obj) {
+        count++;
+        obj = obj->gcNext;
+    }
+    return count;
+}
+
+uint32_t pikaGC_countMarked(void) {
+    uint32_t count = 0;
+    PikaObj* obj = g_PikaObjState.gcChain;
+    while (NULL != obj) {
+        if (obj_getFlag(obj, OBJ_FLAG_GC_MARKED)) {
+            count++;
+        }
+        obj = obj->gcNext;
+    }
+    return count;
+}
+
+uint32_t pikaGC_printFreeList(void) {
+    uint32_t count = 0;
+    PikaObj* obj = g_PikaObjState.gcChain;
+    pika_platform_printf("-----\r\n");
+    while (NULL != obj) {
+        if (!obj_getFlag(obj, OBJ_FLAG_GC_MARKED)) {
+            count++;
+            pika_platform_printf("gc free: ");
+            obj_dump(obj);
+        }
+        obj = obj->gcNext;
+    }
+    pika_platform_printf("-----\r\n");
+    return count;
+}
+
+void obj_dump(PikaObj* self) {
+#if PIKA_KERNAL_DEBUG_ENABLE
+    pika_platform_printf("[\033[32m%s\033[0m]", self->name);
+#endif
+    pika_platform_printf(" \033[36m@%p\033[0m", self);
+    pika_platform_printf("\r\n");
+}
+
+uint32_t pikaGC_markSweepOnce(PikaGC* gc) {
+    _pikaGC_mark(gc);
+    uint32_t count = 0;
+    PikaObj* freeList[16] = {0};
+    PikaObj* obj = g_PikaObjState.gcChain;
+    while (NULL != obj) {
+        if (!obj_getFlag(obj, OBJ_FLAG_GC_MARKED)) {
+            if (count > dimof(freeList) - 1) {
+                break;
+            }
+            freeList[count] = obj;
+            count++;
+        }
+        obj = obj->gcNext;
+    }
+    if (count > 0) {
+        // pikaGC_markDump();
+        // pikaGC_printFreeList();
+        for (uint32_t i = 0; i < count; i++) {
+            pika_platform_printf("GC Free:");
+            obj_dump(freeList[i]);
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            obj_GC(freeList[i]);
+        }
+    }
+    return count;
+}
+
+int32_t _pikaGC_markHandler(Arg* argEach, void* context) {
+    PikaGC* gc = (PikaGC*)context;
+    if (arg_isObject(argEach)) {
+        PikaObj* obj = (PikaObj*)arg_getPtr(argEach);
+#if PIKA_KERNAL_DEBUG_ENABLE
+        obj->gcRoot = (void*)gc->oThis;
+#endif
+        pikaGC_markObj(gc, obj);
+    }
+    return 0;
+}
+
+void pikaGC_markObj(PikaGC* gc, PikaObj* self) {
+    gc->oThis = self;
+    gc->markDeepth++;
+    if (NULL == self) {
+        goto __exit;
+    }
+    if (obj_getFlag(self, OBJ_FLAG_GC_MARKED)) {
+        goto __exit;
+    }
+    obj_setFlag(self, OBJ_FLAG_GC_MARKED);
+    if (NULL != gc->onMarkObj) {
+        gc->onMarkObj(gc);
+    }
+    args_foreach(self->list, _pikaGC_markHandler, gc);
+    if (self->constructor == New_PikaStdData_Dict) {
+        PikaDict* dict = obj_getPtr(self, "dict");
+        if (NULL == dict) {
+            goto __exit;
+        }
+        args_foreach(&dict->super, _pikaGC_markHandler, (void*)gc);
+        goto __exit;
+    }
+    if (self->constructor == New_PikaStdData_List ||
+        self->constructor == New_PikaStdData_Tuple) {
+        PikaList* list = obj_getPtr(self, "list");
+        if (NULL == list) {
+            goto __exit;
+        }
+        args_foreach(&list->super, _pikaGC_markHandler, (void*)gc);
+        goto __exit;
+    }
+__exit:
+    gc->markDeepth--;
+    return;
+}
+
+void _pikaGC_mark(PikaGC* gc) {
+    pikaGC_clean(gc);
+    PikaObj* root = g_PikaObjState.gcChain;
+    while (NULL != root) {
+        if (obj_getFlag(root, OBJ_FLAG_GC_ROOT)) {
+            pikaGC_markObj(gc, root);
+        }
+        root = root->gcNext;
+    }
+}
+
+void pikaGC_mark(void) {
+    PikaGC gc = {0};
+    _pikaGC_mark(&gc);
+}
+
+int _pikaGC_markDumpHandler(PikaGC* gc) {
+    for (uint32_t i = 0; i < gc->markDeepth - 1; i++) {
+        pika_platform_printf("  |");
+    }
+    if (gc->markDeepth != 1) {
+        pika_platform_printf("- ");
+    }
+    obj_dump(gc->oThis);
+    return 0;
+}
+
+#endif
+
+pika_bool obj_checkAlive(PikaObj* self) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return pika_true;
+#else
+    pika_bool ret = pika_false;
+    if (NULL == g_PikaObjState.gcChain) {
+        ret = pika_false;
+        goto __exit;
+    }
+    PikaObj* obj = g_PikaObjState.gcChain;
+    while (NULL != obj) {
+        if (obj == self) {
+            ret = pika_true;
+            goto __exit;
+        }
+        obj = obj->gcNext;
+    }
+__exit:
+#if PIKA_KERNAL_DEBUG_ENABLE
+    if (ret == pika_true) {
+        self->isAlive = ret;
+    }
+#endif
+    return ret;
+#endif
+}
+
+uint32_t pikaGC_markSweep(void) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return 0;
+#else
+    PikaGC gc = {0};
+    uint32_t count = 0;
+    if (pikaGC_islock()) {
+        return 0;
+    }
+    pikaGC_lock();
+    while (pikaGC_markSweepOnce(&gc) != 0) {
+        count++;
+    };
+    if (count > 0) {
+        // pikaGC_markDump();
+    }
+    /* update gc state */
+    g_PikaObjState.objCntLastGC = g_PikaObjState.objCnt;
+    pikaGC_unlock();
+    return count;
+#endif
+}
+
+void pikaGC_markDump(void) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return;
+#else
+    PikaGC gc = {0};
+    pika_platform_printf(
+        "\033[32m"
+        "========= PIKA GC DUMP =========\r\n"
+        "\033[0m");
+    gc.onMarkObj = _pikaGC_markDumpHandler;
+    _pikaGC_mark(&gc);
+#endif
+}
+
+void pikaGC_checkThreshold(void) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return;
+#else
+    if (g_PikaObjState.objCnt >
+        g_PikaObjState.objCntLastGC + PIKA_GC_MARK_SWEEP_THRESHOLD) {
+        pikaGC_markSweep();
+    }
+#endif
+}
+
+void pikaGC_append(PikaObj* self) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return;
+#else
+    g_PikaObjState.objCnt++;
+    if (g_PikaObjState.objCntMax < g_PikaObjState.objCnt) {
+        g_PikaObjState.objCntMax = g_PikaObjState.objCnt;
+    }
+    /* gc single chain */
+    if (NULL == g_PikaObjState.gcChain) {
+        g_PikaObjState.gcChain = self;
+        return;
+    }
+    /* append to head of gc chain */
+    self->gcNext = g_PikaObjState.gcChain;
+    g_PikaObjState.gcChain = self;
+#endif
+}
+
+void obj_removeGcChain(PikaObj* self) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return;
+#else
+    g_PikaObjState.objCnt--;
+    PikaObj* last = pikaGC_getLast(self);
+    if (NULL == last) {
+        /* remove head */
+        g_PikaObjState.gcChain = self->gcNext;
+        return;
+    }
+    last->gcNext = self->gcNext;
+#endif
+}
+
+void obj_enableGC(PikaObj* self) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return;
+#else
+    obj_clearFlag(self, OBJ_FLAG_GC_ROOT);
+#endif
+}
+
+void pikaGC_lock(void) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return;
+#else
+    g_PikaObjState.markSweepBusy++;
+#endif
+}
+
+void pikaGC_unlock(void) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return;
+#else
+    g_PikaObjState.markSweepBusy--;
+#endif
+}
+
+pika_bool pikaGC_islock(void) {
+#if !PIKA_GC_MARK_SWEEP_ENABLE
+    return pika_false;
+#else
+    return g_PikaObjState.markSweepBusy > 0;
+#endif
+}
+
 PikaObj* New_PikaObj(void) {
     PikaObj* self = pikaMalloc(sizeof(PikaObj));
     /* List */
     self->list = New_args(NULL);
     self->refcnt = 0;
-    self->constructor = NULL;
+    self->constructor = New_PikaObj;
     self->flag = 0;
+#if PIKA_GC_MARK_SWEEP_ENABLE
+    self->gcNext = NULL;
+    obj_setFlag(self, OBJ_FLAG_GC_ROOT);
+#endif
+#if PIKA_KERNAL_DEBUG_ENABLE
+    self->aName = NULL;
+    self->name = "PikaObj";
+    self->parent = NULL;
+    self->isAlive = pika_true;
+#endif
+#if PIKA_GC_MARK_SWEEP_ENABLE && PIKA_KERNAL_DEBUG_ENABLE
+    self->gcRoot = NULL;
+#endif
+    /* append to gc chain */
+    pikaGC_append(self);
+    pikaGC_checkThreshold();
     return self;
 }
 
@@ -1667,29 +2475,31 @@ Arg* arg_setRef(Arg* self, char* name, PikaObj* obj) {
 }
 
 int32_t obj_newDirectObj(PikaObj* self, char* objName, NewFun newFunPtr) {
-    Arg* new_obj = arg_newDirectObj(newFunPtr);
-    new_obj = arg_setName(new_obj, objName);
-    arg_setType(new_obj, ARG_TYPE_OBJECT);
-    args_setArg(self->list, new_obj);
+    Arg* aNewObj = arg_newDirectObj(newFunPtr);
+    aNewObj = arg_setName(aNewObj, objName);
+    obj_setName(arg_getPtr(aNewObj), objName);
+    arg_setType(aNewObj, ARG_TYPE_OBJECT);
+    // pikaGC_enable(arg_getPtr(aNewObj));
+    args_setArg(self->list, aNewObj);
     return 0;
 }
 
 int32_t obj_newMetaObj(PikaObj* self, char* objName, NewFun newFunPtr) {
     /* add meta Obj, no inited */
-    Arg* new_obj = arg_newMetaObj(newFunPtr);
-    new_obj = arg_setName(new_obj, objName);
-    args_setArg(self->list, new_obj);
+    Arg* aMetaObj = arg_newMetaObj(newFunPtr);
+    aMetaObj = arg_setName(aMetaObj, objName);
+    args_setArg(self->list, aMetaObj);
     return 0;
 }
 
 static void _append_help(char* name) {
-    if (NULL == _help_modules_cmodule) {
-        _help_modules_cmodule = (volatile Arg*)arg_newStr("");
+    if (NULL == g_PikaObjState.helpModulesCmodule) {
+        g_PikaObjState.helpModulesCmodule = arg_newStr("");
     }
-    Arg* _help = (Arg*)_help_modules_cmodule;
+    Arg* _help = g_PikaObjState.helpModulesCmodule;
     _help = arg_strAppend(_help, name);
     _help = arg_strAppend(_help, "\r\n");
-    _help_modules_cmodule = (volatile Arg*)_help;
+    g_PikaObjState.helpModulesCmodule = _help;
 }
 
 int32_t obj_newObj(PikaObj* self,
@@ -1697,7 +2507,7 @@ int32_t obj_newObj(PikaObj* self,
                    char* className,
                    NewFun newFunPtr) {
     /* before init root object */
-    if (in_root_obj) {
+    if (g_PikaObjState.inRootObj) {
         _append_help(objName);
     }
     return obj_newMetaObj(self, objName, newFunPtr);
@@ -1708,18 +2518,20 @@ PikaObj* obj_importModuleWithByteCode(PikaObj* self,
                                       uint8_t* byteCode) {
     PikaObj* New_PikaStdLib_SysObj(Args * args);
     if (!obj_isArgExist((PikaObj*)__pikaMain, name)) {
+        /* import to main module context */
         obj_newDirectObj((PikaObj*)__pikaMain, name, New_PikaStdLib_SysObj);
         pikaVM_runByteCode(obj_getObj((PikaObj*)__pikaMain, name),
                            (uint8_t*)byteCode);
     }
     if (self != (PikaObj*)__pikaMain) {
-        Arg* module_arg = obj_getArg((PikaObj*)__pikaMain, name);
-        PikaObj* module_obj = arg_getPtr(module_arg);
-        obj_setArg(self, name, module_arg);
-        arg_setIsWeakRef(obj_getArg(self, name), PIKA_TRUE);
-        pika_assert(argType_isObject(arg_getType(module_arg)));
+        /* import to other module context */
+        Arg* aModule = obj_getArg((PikaObj*)__pikaMain, name);
+        PikaObj* oModule = arg_getPtr(aModule);
+        obj_setArg(self, name, aModule);
+        arg_setIsWeakRef(obj_getArg(self, name), pika_true);
+        pika_assert(arg_isObject(aModule));
         /* decrase refcnt to avoid circle reference */
-        obj_refcntDec(module_obj);
+        obj_refcntDec(oModule);
     }
     return self;
 }
@@ -1733,11 +2545,10 @@ PikaObj* obj_importModuleWithByteCodeFrame(PikaObj* self,
     return self;
 }
 
-PikaObj* obj_linkLibraryFile(PikaObj* self, char* input_file_name) {
+int obj_linkLibraryFile(PikaObj* self, char* input_file_name) {
     obj_newMetaObj(self, "@lib", New_LibObj);
     LibObj* lib = obj_getObj(self, "@lib");
-    LibObj_loadLibraryFile(lib, input_file_name);
-    return self;
+    return LibObj_loadLibraryFile(lib, input_file_name);
 }
 
 PikaObj* obj_linkLibrary(PikaObj* self, uint8_t* library_bytes) {
@@ -1750,16 +2561,22 @@ PikaObj* obj_linkLibrary(PikaObj* self, uint8_t* library_bytes) {
 
 void obj_printModules(PikaObj* self) {
     LibObj* lib = obj_getObj(self, "@lib");
-    pika_platform_printf(arg_getStr((Arg*)_help_modules_cmodule));
+    if (lib == NULL) {
+        pika_platform_printf(
+            "Error: Not found LibObj, please execute obj_linkLibrary()\r\n");
+        return;
+    }
+    pika_platform_printf(arg_getStr((Arg*)g_PikaObjState.helpModulesCmodule));
     LibObj_printModules(lib);
 }
 
 PikaObj* obj_linkLibObj(PikaObj* self, LibObj* library) {
-    obj_setPtr(self, "@lib", library);
+    obj_setRef(self, "@lib", library);
     return self;
 }
 
 uint8_t* obj_getByteCodeFromModule(PikaObj* self, char* module_name) {
+    pika_assert(NULL != module_name);
     /* exit when no found '@lib' */
     if (!obj_isArgExist(self, "@lib")) {
         return NULL;
@@ -1784,37 +2601,39 @@ int obj_runModule(PikaObj* self, char* module_name) {
 }
 
 int obj_importModule(PikaObj* self, char* module_name) {
+    if (NULL == module_name) {
+        return -1;
+    }
     /* import bytecode of the module */
     uint8_t* bytecode =
         obj_getByteCodeFromModule((PikaObj*)__pikaMain, module_name);
     if (NULL == bytecode) {
-        return 1;
+        return -1;
     }
     obj_importModuleWithByteCode(self, module_name, bytecode);
     return 0;
 }
 
 char* obj_toStr(PikaObj* self) {
-    /* clang-format off */
-    PIKA_PYTHON(
-        __res = __str__()
-    )
-    /* clang-format on */
-
     /* check method arg */
-    Arg* method_arg = obj_getMethodArg(self, "__str__");
-    if (NULL != method_arg) {
-        arg_deinit(method_arg);
+    Arg* aMethod = obj_getMethodArgWithFullPath(self, "__str__");
+    if (NULL != aMethod) {
+        arg_deinit(aMethod);
+        /* clang-format off */
+        PIKA_PYTHON(
+        @res_str = __str__()
+        )
+        /* clang-format on */
         const uint8_t bytes[] = {
             0x08, 0x00, 0x00, 0x00, /* instruct array size */
-            0x00, 0x82, 0x01, 0x00, 0x00, 0x04, 0x09, 0x00, /* instruct
-                                                               array */
-            0x0f, 0x00, 0x00, 0x00, /* const pool size */
-            0x00, 0x5f, 0x5f, 0x73, 0x74, 0x72, 0x5f, 0x5f, 0x00,
-            0x5f, 0x5f, 0x72, 0x65, 0x73, 0x00, /* const pool */
+            0x00, 0x82, 0x01, 0x00, 0x00, 0x04, 0x09, 0x00, /* instruct array */
+            0x12, 0x00, 0x00, 0x00, /* const pool size */
+            0x00, 0x5f, 0x5f, 0x73, 0x74, 0x72, 0x5f, 0x5f, 0x00, 0x40,
+            0x72, 0x65, 0x73, 0x5f, 0x73, 0x74, 0x72, 0x00, /* const pool */
         };
         pikaVM_runByteCode(self, (uint8_t*)bytes);
-        char* str_res = obj_getStr(self, "__res");
+        char* str_res = obj_cacheStr(self, obj_getStr(self, "@res_str"));
+        obj_removeArg(self, "@res_str");
         return str_res;
     }
 
@@ -1822,9 +2641,9 @@ char* obj_toStr(PikaObj* self) {
     Args buffs = {0};
     char* str_res =
         strsFormat(&buffs, PIKA_SPRINTF_BUFF_SIZE, "<object at %p>", self);
-    obj_setStr(self, "__res", str_res);
+    obj_setStr(self, "@res_str", str_res);
     strsDeinit(&buffs);
-    return obj_getStr(self, "__res");
+    return obj_getStr(self, "@res_str");
 }
 
 void pks_eventListener_registEvent(PikaEventListener* self,
@@ -1839,8 +2658,8 @@ void pks_eventListener_registEvent(PikaEventListener* self,
     strsDeinit(&buffs);
 }
 
+Args buffs = {0};
 void pks_eventListener_removeEvent(PikaEventListener* self, uint32_t eventId) {
-    Args buffs = {0};
     char* event_name =
         strsFormat(&buffs, PIKA_SPRINTF_BUFF_SIZE, "%ld", eventId);
     obj_removeArg(self, event_name);
@@ -1873,6 +2692,7 @@ Arg* __eventListener_runEvent(PikaEventListener* lisener,
                               uint32_t eventId,
                               Arg* eventData) {
     PikaObj* handler = pks_eventListener_getEventHandleObj(lisener, eventId);
+    pika_debug("event handler: %p", handler);
     if (NULL == handler) {
         pika_platform_printf(
             "Error: can not find event handler by id: [0x%02x]\r\n", eventId);
@@ -1893,6 +2713,7 @@ Arg* __eventListener_runEvent(PikaEventListener* lisener,
         0x76, 0x65, 0x6e, 0x74, 0x43, 0x61, 0x6c, 0x6c, 0x42, 0x61, 0x63, 0x6b,
         0x00, 0x5f, 0x72, 0x65, 0x73, 0x00, /* const pool */
     };
+    pika_debug("run event handler: %p", handler);
     pikaVM_runByteCode(handler, (uint8_t*)bytes);
     Arg* res = obj_getArg(handler, "_res");
     res = arg_copy(res);
@@ -1906,10 +2727,20 @@ Arg* __eventListener_runEvent_dataInt(PikaEventListener* lisener,
     return __eventListener_runEvent(lisener, eventId, arg_newInt(eventSignal));
 }
 
+static void _thread_event(void* arg) {
+    pika_assert(_VM_is_first_lock());
+    while (1) {
+        pika_GIL_ENTER();
+        _VMEvent_pickupEvent();
+        pika_GIL_EXIT();
+        pika_platform_thread_delay();
+    }
+}
+
 void _do_pks_eventListener_send(PikaEventListener* self,
                                 uint32_t eventId,
                                 Arg* eventData,
-                                PIKA_BOOL pickupWhenNoVM) {
+                                pika_bool pickupWhenNoVM) {
 #if !PIKA_EVENT_ENABLE
     pika_platform_printf("PIKA_EVENT_ENABLE is not enable");
     while (1) {
@@ -1919,18 +2750,33 @@ void _do_pks_eventListener_send(PikaEventListener* self,
     if (PIKA_RES_OK != __eventListener_pushEvent(self, eventId, eventData)) {
     }
     if (pickupWhenNoVM) {
-        if (0 == _VMEvent_getVMCnt()) {
+        int vmCnt = _VMEvent_getVMCnt();
+        pika_debug("vmCnt: %d", vmCnt);
+        if (0 == vmCnt) {
             /* no vm running, pick up event imediately */
             _VMEvent_pickupEvent();
         }
     }
+#if PIKA_EVENT_THREAD_ENABLE
+    if (g_PikaVMSignal.event_thread_inited) {
+        return;
+    }
+    /* using multi thread */
+    if (_VM_is_first_lock()) {
+        pika_platform_thread_init("pika_event", _thread_event, NULL,
+                                  PIKA_THREAD_STACK_SIZE, PIKA_THREAD_PRIO,
+                                  PIKA_THREAD_TICK);
+        pika_debug("event thread init");
+        g_PikaVMSignal.event_thread_inited = 1;
+    }
+#endif
 #endif
 }
 
 void pks_eventListener_send(PikaEventListener* self,
                             uint32_t eventId,
                             Arg* eventData) {
-    _do_pks_eventListener_send(self, eventId, eventData, PIKA_TRUE);
+    _do_pks_eventListener_send(self, eventId, eventData, pika_true);
 }
 
 void pks_eventListener_sendSignal(PikaEventListener* self,
@@ -1950,11 +2796,11 @@ Arg* pks_eventListener_sendSignalAwaitResult(PikaEventListener* self,
     while (1) {
     };
 #else
-    extern volatile VMSignal PikaVMSignal;
-    int tail = PikaVMSignal.cq.tail;
+    extern volatile VMSignal g_PikaVMSignal;
+    int tail = g_PikaVMSignal.cq.tail;
     pks_eventListener_sendSignal(self, eventId, eventSignal);
     while (1) {
-        Arg* res = PikaVMSignal.cq.res[tail];
+        Arg* res = g_PikaVMSignal.cq.res[tail];
         pika_platform_thread_delay();
         if (NULL != res) {
             return res;
@@ -1971,11 +2817,12 @@ void pks_printVersion(void) {
 }
 
 void pks_getVersion(char* buff) {
-    pika_platform_sprintf(buff, "%d.%d.%d", PIKA_VERSION_MAJOR,
-                          PIKA_VERSION_MINOR, PIKA_VERSION_MICRO);
+    pika_sprintf(buff, "%d.%d.%d", PIKA_VERSION_MAJOR, PIKA_VERSION_MINOR,
+                 PIKA_VERSION_MICRO);
 }
 
 void* obj_getStruct(PikaObj* self, char* name) {
+    pika_assert(self != NULL);
     return args_getStruct(self->list, name);
 }
 
@@ -1985,18 +2832,924 @@ char* obj_cacheStr(PikaObj* self, char* str) {
 
 void _obj_updateProxyFlag(PikaObj* self) {
     if (!obj_getFlag(self, OBJ_FLAG_PROXY_GETATTRIBUTE)) {
-        if (NULL != _obj_getProp(self, "__getattribute__")) {
+        if (NULL != _obj_getPropArg(self, "__getattribute__")) {
             obj_setFlag(self, OBJ_FLAG_PROXY_GETATTRIBUTE);
         }
     }
     if (!obj_getFlag(self, OBJ_FLAG_PROXY_GETATTR)) {
-        if (NULL != _obj_getProp(self, "__getattr__")) {
+        if (NULL != _obj_getPropArg(self, "__getattr__")) {
             obj_setFlag(self, OBJ_FLAG_PROXY_GETATTR);
         }
     }
     if (!obj_getFlag(self, OBJ_FLAG_PROXY_SETATTR)) {
-        if (NULL != _obj_getProp(self, "__setattr__")) {
+        if (NULL != _obj_getPropArg(self, "__setattr__")) {
             obj_setFlag(self, OBJ_FLAG_PROXY_SETATTR);
         }
     }
 };
+
+void builtins_remove(PikaObj* self, char* argPath) {
+    obj_setErrorCode(self, 0);
+    int32_t res = obj_removeArg(self, argPath);
+    if (1 == res) {
+        obj_setSysOut(self, "[error] del: object no found.");
+        obj_setErrorCode(self, 1);
+        return;
+    }
+    if (2 == res) {
+        obj_setSysOut(self, "[error] del: arg not match.");
+        obj_setErrorCode(self, 2);
+        return;
+    }
+}
+
+Arg* _type(Arg* arg);
+Arg* builtins_type(PikaObj* self, Arg* arg) {
+    if (NULL == arg) {
+        obj_setSysOut(self, "[error] type: arg no found.");
+        obj_setErrorCode(self, 1);
+        return NULL;
+    }
+    return _type(arg);
+}
+
+pika_float builtins_float(PikaObj* self, Arg* arg) {
+    ArgType type = arg_getType(arg);
+    if (ARG_TYPE_INT == type) {
+        return (pika_float)arg_getInt(arg);
+    }
+    if (ARG_TYPE_FLOAT == type) {
+        return (pika_float)arg_getFloat(arg);
+    }
+    if (ARG_TYPE_STRING == type) {
+        return strtod(arg_getStr(arg), NULL);
+    }
+    if (ARG_TYPE_BOOL == type) {
+        return (pika_float)arg_getBool(arg);
+    }
+    obj_setSysOut(self, "[error] convert to pika_float type failed.");
+    obj_setErrorCode(self, 1);
+    return _PIKA_FLOAT_ERR;
+}
+
+PIKA_RES _transeInt(Arg* arg, int base, int64_t* res) {
+    ArgType type = arg_getType(arg);
+    if (ARG_TYPE_INT == type) {
+        *res = arg_getInt(arg);
+        return PIKA_RES_OK;
+    }
+    if (ARG_TYPE_BOOL == type) {
+        *res = (int64_t)arg_getBool(arg);
+        return PIKA_RES_OK;
+    }
+    if (ARG_TYPE_FLOAT == type) {
+        *res = (int64_t)arg_getFloat(arg);
+        return PIKA_RES_OK;
+    }
+    if (ARG_TYPE_STRING == type) {
+        *res = strtoll(arg_getStr(arg), NULL, base);
+        return PIKA_RES_OK;
+    }
+    if (ARG_TYPE_BYTES == type) {
+        size_t size = arg_getBytesSize(arg);
+        if (size != 1) {
+            return PIKA_RES_ERR_INVALID_PARAM;
+        }
+        uint8_t val = *arg_getBytes(arg);
+        *res = val;
+        return PIKA_RES_OK;
+    }
+    return PIKA_RES_ERR_INVALID_PARAM;
+}
+
+int builtins_int(PikaObj* self, Arg* arg, PikaTuple* base) {
+    int64_t res = 0;
+    int64_t iBase = 10;
+    if (pikaTuple_getSize(base) > 0) {
+        if (arg_getType(arg) != ARG_TYPE_STRING &&
+            arg_getType(arg) != ARG_TYPE_BYTES) {
+            obj_setSysOut(self,
+                          "TypeError: int() can't convert non-string with "
+                          "explicit base");
+            obj_setErrorCode(self, 1);
+            return _PIKA_INT_ERR;
+        }
+        iBase = (int64_t)pikaTuple_getInt(base, 0);
+    }
+    if (_transeInt(arg, iBase, &res) == PIKA_RES_OK) {
+        return res;
+    }
+    obj_setSysOut(self, "ValueError: invalid literal for int()");
+    obj_setErrorCode(self, 1);
+    return _PIKA_INT_ERR;
+}
+
+pika_bool builtins_bool(PikaObj* self, Arg* arg) {
+    int64_t res = 0;
+    if (_transeInt(arg, 10, &res) == PIKA_RES_OK) {
+        return res ? PIKA_TRUE : pika_false;
+    }
+    obj_setSysOut(self, "ValueError: invalid literal for bool()");
+    obj_setErrorCode(self, 1);
+    return _PIKA_BOOL_ERR;
+}
+
+char* builtins_str(PikaObj* self, Arg* arg) {
+    // if (arg_getType(arg) == ARG_TYPE_BYTES) {
+    //     return obj_cacheStr(self, (char*)arg_getBytes(arg));
+    // }
+    Arg* arg_str = arg_toStrArg(arg);
+    if (NULL == arg_str) {
+        obj_setSysOut(self, "Error: convert to str type failed.");
+        obj_setErrorCode(self, 1);
+        return NULL;
+    }
+    char* str = obj_cacheStr(self, arg_getStr(arg_str));
+    arg_deinit(arg_str);
+    return str;
+}
+
+PikaObj* New_builtins_RangeObj(Args* args);
+Arg* builtins_iter(PikaObj* self, Arg* arg) {
+    /* object */
+    pika_bool bIsTemp = pika_false;
+    PikaObj* oArg = _arg_to_obj(arg, &bIsTemp);
+    NewFun _clsptr = (NewFun)oArg->constructor;
+    if (_clsptr == New_builtins_RangeObj) {
+        /* found RangeObj, return directly */
+        return arg_copy(arg);
+    }
+    /* clang-format off */
+    PIKA_PYTHON(
+    @res_iter = __iter__()
+    )
+    /* clang-format on */
+    const uint8_t bytes[] = {
+        0x08, 0x00, 0x00, 0x00, /* instruct array size */
+        0x00, 0x82, 0x01, 0x00, 0x00, 0x04, 0x0a, 0x00, /* instruct array */
+        0x14, 0x00, 0x00, 0x00,                         /* const pool size */
+        0x00, 0x5f, 0x5f, 0x69, 0x74, 0x65, 0x72, 0x5f, 0x5f, 0x00, 0x40,
+        0x72, 0x65, 0x73, 0x5f, 0x69, 0x74, 0x65, 0x72, 0x00, /* const pool */
+    };
+    Arg* res = pikaVM_runByteCodeReturn(oArg, (uint8_t*)bytes, "@res_iter");
+    if (bIsTemp) {
+        obj_refcntDec(oArg);
+    }
+    return res;
+}
+
+Arg* builtins_range(PikaObj* self, PikaTuple* ax) {
+    /* set template arg to create rangeObj */
+    Arg* aRangeObj = arg_newDirectObj(New_builtins_RangeObj);
+    PikaObj* oRangeObj = arg_getPtr(aRangeObj);
+    RangeData tRangeData = {0};
+    if (pikaTuple_getSize(ax) == 1) {
+        int start = 0;
+        int end = arg_getInt(pikaTuple_getArg(ax, 0));
+        tRangeData.start = start;
+        tRangeData.end = end;
+        tRangeData.step = 1;
+    } else if (pikaTuple_getSize(ax) == 2) {
+        int start = arg_getInt(pikaTuple_getArg(ax, 0));
+        int end = arg_getInt(pikaTuple_getArg(ax, 1));
+        tRangeData.start = start;
+        tRangeData.end = end;
+        tRangeData.step = 1;
+    } else if (pikaTuple_getSize(ax) == 3) {
+        int start = arg_getInt(pikaTuple_getArg(ax, 0));
+        int end = arg_getInt(pikaTuple_getArg(ax, 1));
+        int step = arg_getInt(pikaTuple_getArg(ax, 2));
+        tRangeData.start = start;
+        tRangeData.end = end;
+        tRangeData.step = step;
+    }
+    tRangeData.i = tRangeData.start;
+    obj_setStruct(oRangeObj, "_", tRangeData);
+    return aRangeObj;
+}
+
+Arg* builtins___getitem__(PikaObj* self, Arg* obj, Arg* key) {
+    return _vm_get(NULL, self, key, obj);
+}
+
+Arg* builtins___setitem__(PikaObj* self, Arg* obj, Arg* key, Arg* val) {
+    ArgType obj_type = arg_getType(obj);
+    if (ARG_TYPE_STRING == obj_type) {
+        int index = arg_getInt(key);
+        char* str_val = arg_getStr(val);
+        char* str_pyload = arg_getStr(obj);
+        str_pyload[index] = str_val[0];
+        return arg_newStr(str_pyload);
+    }
+    if (ARG_TYPE_BYTES == obj_type) {
+        int index = arg_getInt(key);
+        uint8_t byte_val = 0;
+        if (ARG_TYPE_BYTES == arg_getType(val)) {
+            uint8_t* bytes_val = arg_getBytes(val);
+            byte_val = bytes_val[0];
+        }
+        if (ARG_TYPE_INT == arg_getType(val)) {
+            byte_val = arg_getInt(val);
+        }
+        uint8_t* bytes_pyload = arg_getBytes(obj);
+        size_t bytes_len = arg_getBytesSize(obj);
+        bytes_pyload[index] = byte_val;
+        return arg_newBytes(bytes_pyload, bytes_len);
+    }
+    if (argType_isObject(obj_type)) {
+        PikaObj* arg_obj = arg_getPtr(obj);
+        obj_setArg(arg_obj, "__key", key);
+        obj_setArg(arg_obj, "__val", val);
+        /* clang-format off */
+        PIKA_PYTHON(
+        __setitem__(__key, __val)
+        )
+        /* clang-format on */
+        const uint8_t bytes[] = {
+            0x0c, 0x00, 0x00, 0x00, /* instruct array size */
+            0x10, 0x81, 0x01, 0x00, 0x10, 0x01, 0x07, 0x00, 0x00, 0x02, 0x0d,
+            0x00,
+            /* instruct array */
+            0x19, 0x00, 0x00, 0x00, /* const pool size */
+            0x00, 0x5f, 0x5f, 0x6b, 0x65, 0x79, 0x00, 0x5f, 0x5f, 0x76, 0x61,
+            0x6c, 0x00, 0x5f, 0x5f, 0x73, 0x65, 0x74, 0x69, 0x74, 0x65, 0x6d,
+            0x5f, 0x5f, 0x00,
+            /* const pool */
+        };
+        pikaVM_runByteCode(arg_obj, (uint8_t*)bytes);
+        return arg_newRef(arg_obj);
+    }
+    return NULL;
+}
+
+int builtins_len(PikaObj* self, Arg* arg) {
+    if (ARG_TYPE_STRING == arg_getType(arg)) {
+        return strGetSize(arg_getStr(arg));
+    }
+    if (ARG_TYPE_BYTES == arg_getType(arg)) {
+        return arg_getBytesSize(arg);
+    }
+
+    if (arg_isObject(arg)) {
+        PikaObj* arg_obj = arg_getPtr(arg);
+        Arg* method_arg = obj_getMethodArgWithFullPath(arg_obj, "__len__");
+        if (NULL != method_arg) {
+            arg_deinit(method_arg);
+            obj_removeArg(arg_obj, "@res_len");
+            /* clang-format off */
+            PIKA_PYTHON(
+            @res_len = __len__()
+            )
+            /* clang-format on */
+            const uint8_t bytes[] = {
+                0x08, 0x00, 0x00, 0x00, /* instruct array size */
+                0x00, 0x82, 0x01, 0x00, 0x00, 0x04, 0x09, 0x00, /* instruct
+                                                                   array */
+                0x12, 0x00, 0x00, 0x00, /* const pool size */
+                0x00, 0x5f, 0x5f, 0x6c, 0x65, 0x6e, 0x5f, 0x5f, 0x00, 0x40,
+                0x72, 0x65, 0x73, 0x5f, 0x6c, 0x65, 0x6e, 0x00, /* const pool */
+            };
+            pikaVM_runByteCode(arg_obj, (uint8_t*)bytes);
+            return obj_getInt(arg_obj, "@res_len");
+        }
+    }
+
+    obj_setErrorCode(self, 1);
+    __platform_printf("[Error] len: arg type not support\r\n");
+    return -1;
+}
+
+Arg* builtins_list(PikaObj* self, PikaTuple* val) {
+#if PIKA_BUILTIN_STRUCT_ENABLE
+    if (1 == pikaTuple_getSize(val)) {
+        Arg* in = pikaTuple_getArg(val, 0);
+        obj_setArg(self, "__list", in);
+        /* clang-format off */
+        PIKA_PYTHON(
+        @res_list = []
+        for __item in __list:
+            @res_list.append(__item)
+        del __item
+        del __list
+
+        )
+        /* clang-format on */
+        const uint8_t bytes[] = {
+            0x3c, 0x00, 0x00, 0x00, /* instruct array size */
+            0x00, 0x95, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x10, 0x81, 0x0b,
+            0x00, 0x00, 0x02, 0x12, 0x00, 0x00, 0x04, 0x17, 0x00, 0x00, 0x82,
+            0x1b, 0x00, 0x00, 0x04, 0x28, 0x00, 0x00, 0x0d, 0x28, 0x00, 0x00,
+            0x07, 0x2f, 0x00, 0x11, 0x81, 0x28, 0x00, 0x01, 0x02, 0x31, 0x00,
+            0x00, 0x86, 0x42, 0x00, 0x00, 0x8c, 0x17, 0x00, 0x00, 0x8c, 0x28,
+            0x00, 0x00, 0x8c, 0x0b, 0x00,
+            /* instruct array */
+            0x45, 0x00, 0x00, 0x00, /* const pool size */
+            0x00, 0x40, 0x72, 0x65, 0x73, 0x5f, 0x6c, 0x69, 0x73, 0x74, 0x00,
+            0x5f, 0x5f, 0x6c, 0x69, 0x73, 0x74, 0x00, 0x69, 0x74, 0x65, 0x72,
+            0x00, 0x24, 0x6c, 0x30, 0x00, 0x24, 0x6c, 0x30, 0x2e, 0x5f, 0x5f,
+            0x6e, 0x65, 0x78, 0x74, 0x5f, 0x5f, 0x00, 0x5f, 0x5f, 0x69, 0x74,
+            0x65, 0x6d, 0x00, 0x32, 0x00, 0x40, 0x72, 0x65, 0x73, 0x5f, 0x6c,
+            0x69, 0x73, 0x74, 0x2e, 0x61, 0x70, 0x70, 0x65, 0x6e, 0x64, 0x00,
+            0x2d, 0x31, 0x00, /* const pool */
+        };
+        return pikaVM_runByteCodeReturn(self, (uint8_t*)bytes, "@res_list");
+    }
+    PikaObj* New_PikaStdData_List(Args * args);
+    return arg_newDirectObj(New_PikaStdData_List);
+#else
+    obj_setErrorCode(self, 1);
+    __platform_printf("[Error] built-in list is not enabled.\r\n");
+    return arg_newNull();
+#endif
+}
+
+Arg* builtins_dict(PikaObj* self, PikaTuple* val) {
+#if PIKA_BUILTIN_STRUCT_ENABLE
+    PikaObj* New_PikaStdData_Dict(Args * args);
+    return arg_newDirectObj(New_PikaStdData_Dict);
+#else
+    obj_setErrorCode(self, 1);
+    __platform_printf("[Error] built-in dist is not enabled.\r\n");
+    return arg_newNull();
+#endif
+}
+
+Arg* builtins_tuple(PikaObj* self, Arg* val) {
+#if PIKA_BUILTIN_STRUCT_ENABLE
+    obj_setErrorCode(self, 1);
+    __platform_printf("Error: tuple() is not supported.\r\n");
+    return arg_newNone();
+#else
+    obj_setErrorCode(self, 1);
+    __platform_printf("[Error] built-in tuple is not enabled.\r\n");
+    return arg_newNull();
+#endif
+}
+
+char* builtins_hex(PikaObj* self, int val) {
+    char buff[PIKA_SPRINTF_BUFF_SIZE] = {0};
+    if (val >= 0) {
+        __platform_sprintf(buff, "0x%02x", val);
+    } else {
+        __platform_sprintf(buff, "-0x%02x", -val);
+    }
+    /* load the string from stack to heap */
+    obj_setStr(self, "__buf", buff);
+    return obj_getStr(self, "__buf");
+}
+
+int builtins_ord(PikaObj* self, char* val) {
+    return (int)val[0];
+}
+
+char* builtins_chr(PikaObj* self, int val) {
+    char buff[PIKA_SPRINTF_BUFF_SIZE] = {0};
+    char to_str[] = "0";
+    to_str[0] = val;
+    __platform_sprintf(buff, "%s", to_str);
+    /* load the string from stack to heap */
+    obj_setStr(self, "__buf", buff);
+    return obj_getStr(self, "__buf");
+}
+
+Arg* builtins_bytes(PikaObj* self, Arg* val) {
+    ArgType type = arg_getType(val);
+    if (ARG_TYPE_INT == type) {
+        int size = arg_getInt(val);
+        /* src is NULL so the bytes are all '\0' */
+        Arg* bytes = arg_newBytes(NULL, size);
+        return bytes;
+    }
+    if (ARG_TYPE_BYTES == type) {
+        return arg_copy(val);
+    }
+    if (ARG_TYPE_STRING == type) {
+        int size = strGetSize(arg_getStr(val));
+        Arg* bytes = arg_newBytes((uint8_t*)arg_getStr(val), size);
+        return bytes;
+    }
+#if !PIKA_NANO_ENABLE
+    if (argType_isObject(type)) {
+        PikaObj* obj = arg_getPtr(val);
+        PikaObj* New_PikaStdData_List(Args * args);
+        PikaObj* New_PikaStdData_Tuple(Args * args);
+        if (obj->constructor == New_PikaStdData_List ||
+            obj->constructor == New_PikaStdData_Tuple) {
+            PikaList* list = obj_getPtr(obj, "list");
+            Arg* bytes = arg_newBytes(NULL, pikaList_getSize(list));
+            uint8_t* bytes_raw = arg_getBytes(bytes);
+            for (size_t i = 0; i < pikaList_getSize(list); i++) {
+                bytes_raw[i] = (uint8_t)pikaList_getInt(list, i);
+            }
+            return bytes;
+        }
+    }
+#endif
+    obj_setErrorCode(self, 1);
+    __platform_printf("Error: input arg type not supported.\r\n");
+    return arg_newNone();
+}
+
+void builtins_print(PikaObj* self, PikaTuple* val, PikaDict* ops) {
+    int arg_size = pikaTuple_getSize(val);
+    char* end = pikaDict_getStr(ops, "end");
+    if (NULL == end) {
+        /* default */
+        end = "\r\n";
+    }
+    if (arg_size == 1) {
+        arg_print(pikaTuple_getArg(val, 0), pika_false, end);
+        return;
+    }
+    Arg* print_out_arg = NULL;
+    pika_bool is_get_print = pika_false;
+    for (int i = 0; i < arg_size; i++) {
+        Arg* arg = pikaTuple_getArg(val, i);
+        Arg* item_arg_str = arg_toStrArg(arg);
+        if (NULL != item_arg_str) {
+            is_get_print = PIKA_TRUE;
+            if (NULL == print_out_arg) {
+                print_out_arg = arg_newStr("");
+            }
+            print_out_arg =
+                arg_strAppend(print_out_arg, arg_getStr(item_arg_str));
+            if (i < arg_size - 1) {
+                print_out_arg = arg_strAppend(print_out_arg, " ");
+            }
+            arg_deinit(item_arg_str);
+        }
+    }
+    if (PIKA_TRUE == is_get_print) {
+        __platform_printf("%s%s", arg_getStr(print_out_arg), end);
+    }
+    if (NULL != print_out_arg) {
+        arg_deinit(print_out_arg);
+    }
+}
+
+char* builtins_cformat(PikaObj* self, char* fmt, PikaTuple* var) {
+#if PIKA_SYNTAX_FORMAT_ENABLE
+    Args buffs = {0};
+    pikaMemMaxReset();
+    char* res = strsFormatList(&buffs, fmt, &var->super);
+    obj_setStr(self, "_buf", res);
+    res = obj_getStr(self, "_buf");
+    strsDeinit(&buffs);
+    return res;
+#else
+    obj_setErrorCode(self, 1);
+    __platform_printf("[Error] PIKA_SYNTAX_FORMAT_ENABLE is not enabled.\r\n");
+    return NULL;
+#endif
+}
+
+int builtins_id(PikaObj* self, Arg* obj) {
+    uintptr_t ptr = 0;
+    if (arg_isObject(obj)) {
+        ptr = (uintptr_t)arg_getPtr(obj);
+    } else {
+        ptr = (uintptr_t)obj;
+    }
+    return ptr & (0x7FFFFFFF);
+}
+
+int PikaStdData_FILEIO_init(PikaObj* self, char* path, char* mode);
+PikaObj* New_PikaStdData_FILEIO(Args* args);
+PikaObj* builtins_open(PikaObj* self, char* path, char* mode) {
+#if PIKA_FILEIO_ENABLE
+    PikaObj* file = newNormalObj(New_PikaStdData_FILEIO);
+    if (0 != PikaStdData_FILEIO_init(file, path, mode)) {
+        obj_setErrorCode(self, 1);
+        __platform_printf("[Error] open: can not open file.\r\n");
+        obj_deinit(file);
+        return NULL;
+    }
+    return file;
+#else
+    obj_setErrorCode(self, 1);
+    __platform_printf("[Error] PIKA_FILEIO_ENABLE is not enabled.\r\n");
+    return NULL;
+#endif
+}
+
+/* __dir_each */
+int32_t __dir_each(Arg* argEach, void* context) {
+    PikaObj* list = args_getPtr((Args*)context, "list");
+    if (argType_isCallable(arg_getType(argEach))) {
+        char name_buff[PIKA_LINE_BUFF_SIZE] = {0};
+        char* method_name =
+            methodArg_getName(argEach, name_buff, sizeof(name_buff));
+        Arg* arg_str = arg_newStr(method_name);
+        __vm_List_append(list, arg_str);
+        arg_deinit(arg_str);
+    }
+    return 0;
+}
+
+PikaObj* builtins_dir(PikaObj* self, Arg* arg) {
+    if (!arg_isObject(arg)) {
+        obj_setErrorCode(self, 1);
+        __platform_printf("[Error] dir: not support type.\r\n");
+        return NULL;
+    }
+    PikaObj* obj = arg_getPtr(arg);
+    PikaObj* New_PikaStdData_List(Args * args);
+    PikaObj* list = newNormalObj(New_PikaStdData_List);
+    __vm_List___init__(list);
+    Args* context = New_args(NULL);
+    args_setPtr(context, "list", list);
+    args_foreach(obj->list, __dir_each, context);
+    args_deinit(context);
+    return list;
+}
+
+void builtins_exec(PikaObj* self, char* code) {
+#if PIKA_EXEC_ENABLE
+    obj_run(self, code);
+#else
+    obj_setErrorCode(self, 1);
+    __platform_printf("[Error] PIKA_EXEC_ENABLE is not enabled.\r\n");
+#endif
+}
+
+Arg* builtins_getattr(PikaObj* self, PikaObj* obj, char* name) {
+    Arg* res = NULL;
+    if (NULL == obj) {
+        obj_setErrorCode(self, 1);
+        __platform_printf("[Error] getattr: can not get attr of NULL.\r\n");
+        return NULL;
+    }
+    Arg* arg = obj_getArg(obj, name);
+    if (NULL == arg) {
+        arg = obj_getMethodArgWithFullPath(obj, name);
+    }
+    if (NULL != arg) {
+        res = arg_copy(arg);
+        methodArg_setHostObj(res, obj);
+    }
+    return res;
+}
+
+void builtins_setattr(PikaObj* self, PikaObj* obj, char* name, Arg* val) {
+    if (NULL == obj) {
+        obj_setErrorCode(self, 1);
+        __platform_printf("[Error] setattr: obj is null.\r\n");
+        goto exit;
+    }
+    obj_setArg(obj, name, val);
+exit:
+    return;
+}
+
+void builtins_exit(PikaObj* self) {
+    pks_vm_exit();
+}
+
+int builtins_hasattr(PikaObj* self, PikaObj* obj, char* name) {
+    if (NULL == obj) {
+        obj_setErrorCode(self, 1);
+        __platform_printf("[Error] hasattr: obj is null.\r\n");
+        return 0;
+    }
+    if (obj_isArgExist(obj, name)) {
+        return 1;
+    }
+    Arg* method = obj_getMethodArgWithFullPath(obj, name);
+    if (NULL != method) {
+        arg_deinit(method);
+        return 1;
+    }
+    return 0;
+}
+
+Arg* builtins_eval(PikaObj* self, char* code) {
+    Args buffs = {0};
+    char* cmd = strsAppend(&buffs, "@res = ", code);
+    obj_run(self, cmd);
+    Arg* res = arg_copy(obj_getArg(self, "@res"));
+    strsDeinit(&buffs);
+    obj_removeArg(self, "@res");
+    return res;
+}
+
+static enum shellCTRL __obj_shellLineHandler_input(PikaObj* self,
+                                                   char* input_line,
+                                                   struct ShellConfig* cfg) {
+    cfg->context = arg_newStr(input_line);
+    return SHELL_CTRL_EXIT;
+}
+
+Arg* _type(Arg* arg) {
+    Arg* result;
+    PikaObj* oBuiltins = NULL;
+
+    ArgType type = arg_getType(arg);
+    oBuiltins = obj_getBuiltins();
+
+    if (ARG_TYPE_INT == type) {
+        result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "int"));
+        goto __exit;
+    }
+
+    if (ARG_TYPE_FLOAT == type) {
+        result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "float"));
+        goto __exit;
+    }
+
+    if (ARG_TYPE_STRING == type) {
+        result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "str"));
+        goto __exit;
+    }
+
+    if (ARG_TYPE_BOOL == type) {
+        result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "bool"));
+        goto __exit;
+    }
+
+    if (ARG_TYPE_BYTES == type) {
+        result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "bytes"));
+        goto __exit;
+    }
+
+    if (argType_isObject(type)) {
+        PikaObj* obj = arg_getPtr(arg);
+        NewFun clsptr = obj_getClass(obj);
+        PikaObj* New_PikaStdData_List(Args * args);
+
+        if (clsptr == New_PikaStdData_List) {
+            result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "list"));
+            goto __exit;
+        }
+
+        PikaObj* New_PikaStdData_Dict(Args * args);
+
+        if (clsptr == New_PikaStdData_Dict) {
+            result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "dict"));
+            goto __exit;
+        }
+
+        PikaObj* New_PikaStdData_Tuple(Args * args);
+
+        if (clsptr == New_PikaStdData_Tuple) {
+            result = arg_copy(obj_getMethodArgWithFullPath(oBuiltins, "tuple"));
+            goto __exit;
+        }
+
+#if PIKA_TYPE_FULL_FEATURE_ENABLE
+        Arg* aMethod = obj_getArg(obj, "__class__");
+
+        if (NULL != aMethod) {
+            result = arg_copy(aMethod);
+            goto __exit;
+        }
+#endif
+        result = arg_newStr("<class 'object'>");
+        goto __exit;
+    }
+
+    if (ARG_TYPE_OBJECT_META == type) {
+        result = arg_newStr("<class 'meta object'>");
+        goto __exit;
+    }
+
+    if (ARG_TYPE_METHOD_OBJECT == type) {
+        result = arg_newStr("<class 'method'>");
+        goto __exit;
+    }
+
+    if (ARG_TYPE_METHOD_STATIC == type) {
+        result = arg_newStr("<class 'function'>");
+        goto __exit;
+    }
+
+    if (ARG_TYPE_NONE == type) {
+        result = arg_newStr("<class 'NoneType'>");
+        goto __exit;
+    }
+
+    result = arg_newStr("<class 'buitin_function_or_method'>");
+
+__exit:
+    if (NULL != oBuiltins) {
+        obj_deinit(oBuiltins);
+    }
+    return result;
+}
+
+pika_bool _isinstance(Arg* aObj, Arg* classinfo) {
+    pika_bool res = pika_false;
+    Arg* aObjType = NULL;
+    aObjType = _type(aObj);
+    NativeProperty* objProp = NULL;
+    while (1) {
+        if (arg_getPtr(aObjType) == arg_getPtr(classinfo)) {
+            res = pika_true;
+            goto __exit;
+        }
+        aObjType = methodArg_super(aObjType, &objProp);
+        if (NULL != objProp) {
+            if (!(arg_getType(classinfo) ==
+                  ARG_TYPE_METHOD_NATIVE_CONSTRUCTOR)) {
+                res = pika_false;
+                goto __exit;
+            }
+            NativeProperty* classProp = methodArg_toProp(classinfo);
+            while (1) {
+                if (objProp == classProp) {
+                    res = pika_true;
+                    goto __exit;
+                }
+                if (objProp->super == NULL) {
+                    res = pika_false;
+                    goto __exit;
+                }
+                objProp = (NativeProperty*)objProp->super;
+            }
+        }
+        if (NULL == aObjType) {
+            res = pika_false;
+            goto __exit;
+        }
+    }
+__exit:
+    if (NULL != aObjType) {
+        arg_deinit(aObjType);
+    }
+    return res;
+}
+
+char* builtins_input(PikaObj* self, PikaTuple* info) {
+    struct ShellConfig cfg = {
+        .prefix = "",
+        .context = NULL,
+        .handler = __obj_shellLineHandler_input,
+        .fn_getchar = __platform_getchar,
+    };
+    if (pikaTuple_getSize(info) > 0) {
+        __platform_printf("%s", pikaTuple_getStr(info, 0));
+    }
+    _temp__do_pikaScriptShell(self, &cfg);
+    char* res = obj_cacheStr(self, arg_getStr(cfg.context));
+    arg_deinit(cfg.context);
+    return res;
+}
+
+extern volatile PikaObj* __pikaMain;
+void builtins_help(PikaObj* self, char* name) {
+    if (strEqu(name, "modules")) {
+        obj_printModules((PikaObj*)__pikaMain);
+    }
+}
+
+void builtins_reboot(PikaObj* self) {
+    pika_platform_reboot();
+}
+
+void builtins_clear(PikaObj* self) {
+    pika_platform_clear();
+}
+
+void builtins_gcdump(PikaObj* self) {
+    pikaGC_markDump();
+}
+
+Arg* builtins_abs(PikaObj* self, Arg* val) {
+    ArgType type = arg_getType(val);
+    if (type == ARG_TYPE_INT) {
+        int64_t v = arg_getInt(val);
+        if (v < 0) {
+            v = -v;
+        }
+        return arg_newInt(v);
+    }
+    if (type == ARG_TYPE_FLOAT) {
+        pika_float v = arg_getFloat(val);
+        if (v < 0) {
+            v = -v;
+        }
+        return arg_newFloat(v);
+    }
+    obj_setSysOut(self, "TypeError: bad operand type for abs()");
+    obj_setErrorCode(self, PIKA_RES_ERR_INVALID_PARAM);
+    return NULL;
+}
+
+PikaObj* New_PikaStdData_Tuple(Args* args);
+/* clang-format off */
+PIKA_PYTHON(
+@res_max = @list[0]
+for @item in @list:
+    if @item > @res_max:
+        @res_max = @item
+)
+/* clang-format on */
+const uint8_t bc_max[] = {
+    0x4c, 0x00, 0x00, 0x00, /* instruct array size */
+    0x10, 0x81, 0x01, 0x00, 0x10, 0x05, 0x07, 0x00, 0x00, 0x1d, 0x00, 0x00,
+    0x00, 0x04, 0x09, 0x00, 0x10, 0x81, 0x01, 0x00, 0x00, 0x02, 0x12, 0x00,
+    0x00, 0x04, 0x17, 0x00, 0x00, 0x82, 0x1b, 0x00, 0x00, 0x04, 0x28, 0x00,
+    0x00, 0x0d, 0x28, 0x00, 0x00, 0x07, 0x2e, 0x00, 0x11, 0x81, 0x28, 0x00,
+    0x11, 0x01, 0x09, 0x00, 0x01, 0x08, 0x30, 0x00, 0x01, 0x07, 0x32, 0x00,
+    0x02, 0x81, 0x28, 0x00, 0x02, 0x04, 0x09, 0x00, 0x00, 0x86, 0x34, 0x00,
+    0x00, 0x8c, 0x17, 0x00, /* instruct array */
+    0x37, 0x00, 0x00, 0x00, /* const pool size */
+    0x00, 0x40, 0x6c, 0x69, 0x73, 0x74, 0x00, 0x30, 0x00, 0x40, 0x72, 0x65,
+    0x73, 0x5f, 0x6d, 0x61, 0x78, 0x00, 0x69, 0x74, 0x65, 0x72, 0x00, 0x24,
+    0x6c, 0x30, 0x00, 0x24, 0x6c, 0x30, 0x2e, 0x5f, 0x5f, 0x6e, 0x65, 0x78,
+    0x74, 0x5f, 0x5f, 0x00, 0x40, 0x69, 0x74, 0x65, 0x6d, 0x00, 0x32, 0x00,
+    0x3e, 0x00, 0x31, 0x00, 0x2d, 0x31, 0x00, /* const pool */
+};
+
+/* clang-format off */
+PIKA_PYTHON(
+@res_max = @list[0]
+for @item in @list:
+    if @item < @res_max:
+        @res_max = @item
+
+)
+/* clang-format on */
+const uint8_t bc_min[] = {
+    0x4c, 0x00, 0x00, 0x00, /* instruct array size */
+    0x10, 0x81, 0x01, 0x00, 0x10, 0x05, 0x07, 0x00, 0x00, 0x1d, 0x00, 0x00,
+    0x00, 0x04, 0x09, 0x00, 0x10, 0x81, 0x01, 0x00, 0x00, 0x02, 0x12, 0x00,
+    0x00, 0x04, 0x17, 0x00, 0x00, 0x82, 0x1b, 0x00, 0x00, 0x04, 0x28, 0x00,
+    0x00, 0x0d, 0x28, 0x00, 0x00, 0x07, 0x2e, 0x00, 0x11, 0x81, 0x28, 0x00,
+    0x11, 0x01, 0x09, 0x00, 0x01, 0x08, 0x30, 0x00, 0x01, 0x07, 0x32, 0x00,
+    0x02, 0x81, 0x28, 0x00, 0x02, 0x04, 0x09, 0x00, 0x00, 0x86, 0x34, 0x00,
+    0x00, 0x8c, 0x17, 0x00, /* instruct array */
+    0x37, 0x00, 0x00, 0x00, /* const pool size */
+    0x00, 0x40, 0x6c, 0x69, 0x73, 0x74, 0x00, 0x30, 0x00, 0x40, 0x72, 0x65,
+    0x73, 0x5f, 0x6d, 0x61, 0x78, 0x00, 0x69, 0x74, 0x65, 0x72, 0x00, 0x24,
+    0x6c, 0x30, 0x00, 0x24, 0x6c, 0x30, 0x2e, 0x5f, 0x5f, 0x6e, 0x65, 0x78,
+    0x74, 0x5f, 0x5f, 0x00, 0x40, 0x69, 0x74, 0x65, 0x6d, 0x00, 0x32, 0x00,
+    0x3c, 0x00, 0x31, 0x00, 0x2d, 0x31, 0x00, /* const pool */
+};
+
+Arg* _max_min(PikaObj* self, PikaTuple* val, uint8_t* bc) {
+    int size = pikaTuple_getSize(val);
+    if (size == 0) {
+        obj_setSysOut(self, "TypeError: max expected 1 arguments, got 0");
+        obj_setErrorCode(self, PIKA_RES_ERR_INVALID_PARAM);
+        return NULL;
+    }
+    if (size == 1) {
+        ArgType type = arg_getType(pikaTuple_getArg(val, 0));
+        if ((!argType_isObject(type) && (type != ARG_TYPE_STRING) &&
+             (type != ARG_TYPE_BYTES))) {
+            obj_setSysOut(self, "TypeError: object is not iterable");
+            obj_setErrorCode(self, PIKA_RES_ERR_INVALID_PARAM);
+            return NULL;
+        }
+        obj_setArg(self, "@list", pikaTuple_getArg(val, 0));
+        return pikaVM_runByteCodeReturn(self, (uint8_t*)bc, "@res_max");
+    }
+    PikaObj* oTuple = newNormalObj(New_PikaStdData_Tuple);
+    obj_setPtr(oTuple, "list", val);
+    obj_setInt(oTuple, "needfree", 0);
+    Arg* aTuple = arg_newObj(oTuple);
+    obj_setArg(self, "@list", aTuple);
+    Arg* aRet = pikaVM_runByteCodeReturn(self, (uint8_t*)bc, "@res_max");
+    arg_deinit(aTuple);
+    return aRet;
+}
+
+Arg* builtins_max(PikaObj* self, PikaTuple* val) {
+    return _max_min(self, val, (uint8_t*)bc_max);
+}
+
+Arg* builtins_min(PikaObj* self, PikaTuple* val) {
+    return _max_min(self, val, (uint8_t*)bc_min);
+}
+
+pika_bool builtins_isinstance(PikaObj* self, Arg* object, Arg* classinfo) {
+    if (!argType_isConstructor(arg_getType(classinfo)) &&
+        !argType_isCallable(arg_getType(classinfo))) {
+        obj_setErrorCode(self, 1);
+        __platform_printf("TypeError: isinstance() arg 2 must be a type\r\n");
+        return pika_false;
+    }
+    return _isinstance(object, classinfo);
+}
+
+Arg* builtins_StringObj___next__(PikaObj* self) {
+    return arg_newNone();
+}
+
+Arg* builtins_RangeObj___next__(PikaObj* self) {
+    RangeData* _ = (RangeData*)args_getStruct(self->list, "_");
+    int end = _->end;
+    int step = _->step;
+    /* exit */
+    if (_->i >= end) {
+        return arg_newNone();
+    }
+    Arg* res = arg_newInt(_->i);
+    _->i += step;
+    return res;
+}
+
+PikaObj* New_builtins(Args* args);
+PikaObj* obj_getBuiltins(void) {
+    return newNormalObj(New_builtins);
+}

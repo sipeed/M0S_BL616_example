@@ -25,7 +25,7 @@ void PikaStdData_List___init__(PikaObj* self) {
     __vm_List___init__(self);
 }
 
-char* PikaStdLib_SysObj_str(PikaObj* self, Arg* arg);
+char* builtins_str(PikaObj* self, Arg* arg);
 char* PikaStdData_List___str__(PikaObj* self) {
     Arg* str_arg = arg_newStr("[");
     PikaList* list = obj_getPtr(self, "list");
@@ -39,7 +39,7 @@ char* PikaStdData_List___str__(PikaObj* self) {
         if (i != 0) {
             str_arg = arg_strAppend(str_arg, ", ");
         }
-        char* item_str = PikaStdLib_SysObj_str(self, item);
+        char* item_str = builtins_str(self, item);
         if (arg_getType(item) == ARG_TYPE_STRING) {
             str_arg = arg_strAppend(str_arg, "'");
         }
@@ -78,7 +78,7 @@ PikaObj* PikaStdData_List___add__(PikaObj* self, PikaObj* others) {
     return res;
 }
 
-void PikaStdData_List_insert(PikaObj *self, int i, Arg* arg){
+void PikaStdData_List_insert(PikaObj* self, int i, Arg* arg) {
     PikaList* list = obj_getPtr(self, "list");
     if (PIKA_RES_OK != pikaList_insert(list, i, arg)) {
         obj_setErrorCode(self, 1);
@@ -86,13 +86,24 @@ void PikaStdData_List_insert(PikaObj *self, int i, Arg* arg){
     }
 }
 
-Arg* PikaStdData_List_pop(PikaObj *self){
+Arg* PikaStdData_List_pop(PikaObj* self, PikaTuple* index) {
+    int i = 0;
     PikaList* list = obj_getPtr(self, "list");
-    return pikaList_pop(list);
+    if (pikaTuple_getSize(index) == 1) {
+        if (pikaTuple_getType(index, 0) == ARG_TYPE_INT) {
+            i = pikaTuple_getInt(index, 0);
+        } else {
+            obj_setErrorCode(self, 1);
+            obj_setSysOut(self, "Error: index must be int.");
+            return NULL;
+        }
+        return pikaList_pop_withIndex(list, i);
+    } else {
+        return pikaList_pop(list);
+    }
 }
 
-void PikaStdData_List_remove(PikaObj *self, Arg* val){
+void PikaStdData_List_remove(PikaObj* self, Arg* val) {
     PikaList* list = obj_getPtr(self, "list");
     pikaList_remove(list, val);
 }
-

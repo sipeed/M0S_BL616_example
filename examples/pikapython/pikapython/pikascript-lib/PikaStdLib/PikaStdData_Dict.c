@@ -8,12 +8,14 @@
 #include "dataStrs.h"
 
 Arg* PikaStdData_Dict_get(PikaObj* self, char* key) {
+    pika_assert_obj_alive(self);
     PikaDict* dict = obj_getPtr(self, "dict");
     Arg* res = pikaDict_getArg(dict, key);
     if (NULL == res) {
         obj_setErrorCode(self, PIKA_RES_ERR_RUNTIME_ERROR);
         __platform_printf("KeyError: %s\n", key);
     }
+    pika_assert_arg_alive(res);
     return arg_copy(res);
 }
 
@@ -42,7 +44,7 @@ Arg* PikaStdData_Dict___next__(PikaObj* self) {
     PikaDict* keys = obj_getPtr(self, "_keys");
     Arg* res = arg_copy(args_getArgByIndex(&keys->super, __iter_i));
     if (NULL == res) {
-        return arg_newNull();
+        return arg_newNone();
     }
     args_setInt(self->list, "__iter_i", __iter_i + 1);
     return res;
@@ -93,13 +95,13 @@ Arg* PikaStdData_dict_keys___next__(PikaObj* self) {
     PikaDict* keys = obj_getPtr(dictptr, "_keys");
     Arg* res = arg_copy(args_getArgByIndex(&keys->super, __iter_i));
     if (NULL == res) {
-        return arg_newNull();
+        return arg_newNone();
     }
     args_setInt(self->list, "__iter_i", __iter_i + 1);
     return res;
 }
 
-char* PikaStdLib_SysObj_str(PikaObj* self, Arg* arg);
+char* builtins_str(PikaObj* self, Arg* arg);
 char* PikaStdData_dict_keys___str__(PikaObj* self) {
     Arg* str_arg = arg_newStr("dict_keys([");
     PikaObj* dictptr = obj_getPtr(self, "dictptr");
@@ -114,7 +116,7 @@ char* PikaStdData_dict_keys___str__(PikaObj* self) {
         if (i != 0) {
             str_arg = arg_strAppend(str_arg, ", ");
         }
-        char* item_str = PikaStdLib_SysObj_str(self, item);
+        char* item_str = builtins_str(self, item);
         if (arg_getType(item) == ARG_TYPE_STRING) {
             str_arg = arg_strAppend(str_arg, "'");
         }
@@ -149,13 +151,13 @@ char* PikaStdData_Dict___str__(PikaObj* self) {
         if (i != 0) {
             str_arg = arg_strAppend(str_arg, ", ");
         }
-        char* key_str = PikaStdLib_SysObj_str(self, item_key);
+        char* key_str = builtins_str(self, item_key);
         str_arg = arg_strAppend(str_arg, "'");
         str_arg = arg_strAppend(str_arg, key_str);
         str_arg = arg_strAppend(str_arg, "'");
         str_arg = arg_strAppend(str_arg, ": ");
 
-        char* val_str = PikaStdLib_SysObj_str(self, item_val);
+        char* val_str = builtins_str(self, item_val);
         if (arg_getType(item_val) == ARG_TYPE_STRING) {
             str_arg = arg_strAppend(str_arg, "'");
         }
@@ -195,7 +197,7 @@ int dict_contains(PikaDict* dict, Arg* key) {
         }
         i++;
     }
-    return PIKA_FALSE;
+    return pika_false;
 }
 
 int PikaStdData_Dict___contains__(PikaObj* self, Arg* val) {
@@ -222,7 +224,7 @@ Arg* PikaStdData_dict_items___next__(PikaObj* self) {
     Arg* key = args_getArgByIndex(&keys->super, __iter_i);
     Arg* val = args_getArgByIndex(&dict->super, __iter_i);
     if (NULL == key) {
-        return arg_newNull();
+        return arg_newNone();
     }
     PikaObj* tuple = newNormalObj(New_PikaStdData_Tuple);
     PikaStdData_Tuple___init__(tuple);
@@ -246,7 +248,7 @@ char* PikaStdData_dict_items___str__(PikaObj* self) {
         if (i != 0) {
             str_arg = arg_strAppend(str_arg, ", ");
         }
-        char* item_str = PikaStdLib_SysObj_str(self, item);
+        char* item_str = builtins_str(self, item);
         str_arg = arg_strAppend(str_arg, item_str);
         i++;
         arg_deinit(item);
@@ -271,7 +273,7 @@ void PikaStdData_Dict_update(PikaObj* self, PikaObj* other) {
     const uint8_t
         bytes[] =
             {
-                0x40, 0x00, 0x00, 0x00,/* instruct array size */
+                0x40, 0x00, 0x00, 0x00, /* instruct array size */
                 0x10, 0x81, 0x01, 0x00, 0x00, 0x02, 0x08, 0x00, 0x00, 0x04,
                 0x0d, 0x00, 0x00, 0x82, 0x11, 0x00, 0x00, 0x04, 0x1e, 0x00,
                 0x00, 0x0d, 0x1e, 0x00, 0x00, 0x07, 0x24, 0x00, 0x11, 0x81,
@@ -279,7 +281,7 @@ void PikaStdData_Dict_update(PikaObj* self, PikaObj* other) {
                 0x21, 0x01, 0x1e, 0x00, 0x11, 0x1d, 0x00, 0x00, 0x01, 0x02,
                 0x2c, 0x00, 0x01, 0x04, 0x26, 0x00, 0x00, 0x86, 0x38, 0x00,
                 0x00, 0x8c, 0x0d, 0x00, /* instruct array */
-                0x3b, 0x00, 0x00, 0x00,            /* const pool size */
+                0x3b, 0x00, 0x00, 0x00, /* const pool size */
                 0x00, 0x40, 0x6f, 0x74, 0x68, 0x65, 0x72, 0x00, 0x69, 0x74,
                 0x65, 0x72, 0x00, 0x24, 0x6c, 0x30, 0x00, 0x24, 0x6c, 0x30,
                 0x2e, 0x5f, 0x5f, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x5f, 0x00,

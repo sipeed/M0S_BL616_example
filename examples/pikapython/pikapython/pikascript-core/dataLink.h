@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -24,6 +24,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #ifndef _link2__H
 #define _link2__H
@@ -49,4 +53,8 @@ void link_removeNode_notDeinitNode(Link* self, void* content);
 LinkNode* link_getNode(Link* self, int64_t id);
 int32_t link_getSize(Link* self);
 Link* New_link(void* args);
+#endif
+
+#ifdef __cplusplus
+}
 #endif

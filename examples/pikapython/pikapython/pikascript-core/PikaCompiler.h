@@ -1,3 +1,7 @@
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef __PIKA_COMPILER__H
 #define __PIKA_COMPILER__H
 #include "PikaObj.h"
@@ -31,7 +35,7 @@ PIKA_RES pikaMaker_linkCompiledModulesFullPath(PikaMaker* self, char* lib_path);
 PIKA_RES pikaMaker_linkCompiledModules(PikaMaker* self, char* lib_name);
 PIKA_RES _do_pikaMaker_linkCompiledModules(PikaMaker* self,
                                            char* lib_name,
-                                           PIKA_BOOL gen_c_array);
+                                           pika_bool gen_c_array);
 int LibObj_loadLibrary(LibObj* self, uint8_t* library_bytes);
 void LibObj_printModules(LibObj* self);
 void pikaMaker_deinit(PikaMaker* self);
@@ -41,7 +45,7 @@ PIKA_RES _loadModuleDataWithName(uint8_t* library_bytes,
                                  uint8_t** addr_p,
                                  size_t* size_p);
 
-#define LIB_VERSION_NUMBER 3
+#define LIB_VERSION_NUMBER 4
 #define LIB_INFO_BLOCK_SIZE 32
 #define PIKA_APP_MAGIC_CODE_OFFSET 0
 #define PIKA_APP_MODULE_SIZE_OFFSET 1
@@ -52,11 +56,18 @@ typedef struct {
     uint8_t* addr;
     size_t size;
     size_t pos;
+    pika_bool need_free;
 } pikafs_FILE;
 
 pikafs_FILE* pikafs_fopen(char* file_name, char* mode);
+pikafs_FILE* pikafs_fopen_pack(char* pack_name, char* file_name);
 int pikafs_fread(void* buf, size_t size, size_t count, pikafs_FILE* file);
 int pikafs_fwrite(void* buf, size_t size, size_t count, pikafs_FILE* file);
 int pikafs_fclose(pikafs_FILE* file);
+PIKA_RES pikafs_unpack_files(char* pack_name, char* out_path);
+PIKA_RES pikafs_pack_files(char* pack_name, int file_num, ...);
 
+#endif
+#ifdef __cplusplus
+}
 #endif

@@ -3,7 +3,6 @@ import random
 import PikaStdData
 import configparser
 import pika_cjson
-import PikaMath
 import unittest
 import re
 import binascii

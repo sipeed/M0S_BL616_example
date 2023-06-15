@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -24,6 +24,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #ifndef _dataArgs__H
 #define _dataArgs__H
@@ -71,7 +75,7 @@ void* args_getPtr(Args* self, char* name);
 
 PIKA_RES args_setInt(Args* self, char* name, int64_t int64In);
 int64_t args_getInt(Args* self, char* name);
-PIKA_BOOL args_getBool(Args* self, char* name);
+pika_bool args_getBool(Args* self, char* name);
 
 char* args_print(Args* self, char* name);
 
@@ -107,8 +111,8 @@ PIKA_RES args_setPtrWithType(Args* self,
                              ArgType type,
                              void* objPtr);
 PIKA_RES args_foreach(Args* self,
-                      int32_t (*eachHandle)(Arg* argEach, Args* context),
-                      Args* context);
+                      int32_t (*eachHandle)(Arg* argEach, void* context),
+                      void* context);
 
 char* args_getBuff(Args* self, int32_t size);
 PIKA_RES args_pushArg(Args* self, Arg* arg);
@@ -223,6 +227,7 @@ size_t pikaList_getSize(PikaList* self);
 void pikaList_reverse(PikaList* self);
 PIKA_RES pikaList_insert(PikaList* self, int index, Arg* arg);
 Arg* pikaList_pop(PikaList* list);
+Arg* pikaList_pop_withIndex(PikaList* list, int index);
 PIKA_RES pikaList_remove(PikaList* list, Arg* arg);
 static inline void pikaList_deinit(PikaList* self) {
     args_deinit((&((self)->super)));
@@ -243,6 +248,9 @@ static inline Arg* pikaTuple_getArg(PikaTuple* self, int index) {
 }
 
 static inline size_t pikaTuple_getSize(PikaTuple* self) {
+    if (self == NULL) {
+        return 0;
+    }
     return pikaList_getSize((&((self)->super)));
 }
 
@@ -275,4 +283,8 @@ char* strsFormatList(Args* out_buffs, char* fmt, PikaList* list);
 char* args_cacheStr(Args* self, char* str);
 char* strsFormatArg(Args* out_buffs, char* fmt, Arg* arg);
 
+#endif
+
+#ifdef __cplusplus
+}
 #endif

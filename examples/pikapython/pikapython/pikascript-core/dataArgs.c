@@ -1,6 +1,6 @@
 /*
- * This file is part of the PikaScript project.
- * http://github.com/pikastech/pikascript
+ * This file is part of the PikaPython project.
+ * http://github.com/pikastech/pikapython
  *
  * MIT License
  *
@@ -78,9 +78,10 @@ PIKA_RES args_setPtr(Args* self, char* name, void* argPointer) {
 
 PIKA_RES args_setRef(Args* self, char* name, void* argPointer) {
     PIKA_RES errCode = PIKA_RES_OK;
-    Arg* argNew = New_arg(NULL);
-    argNew = arg_setRef(argNew, name, argPointer);
-    args_setArg(self, argNew);
+    Arg* aNewRef = New_arg(NULL);
+    aNewRef = arg_setRef(aNewRef, name, argPointer);
+    // pikaGC_enable(arg_getPtr(aNewRef));
+    args_setArg(self, aNewRef);
     return errCode;
 }
 
@@ -97,7 +98,7 @@ PIKA_RES args_setStr(Args* self, char* name, char* strIn) {
 
 PIKA_RES args_setNone(Args* self, char* name) {
     PIKA_RES errCode = PIKA_RES_OK;
-    Arg* argNew = arg_newNull();
+    Arg* argNew = arg_newNone();
     arg_setName(argNew, name);
     args_setArg(self, argNew);
     return errCode;
@@ -201,7 +202,7 @@ int64_t args_getInt(Args* self, char* name) {
     return _PIKA_INT_ERR;
 }
 
-PIKA_BOOL args_getBool(Args* self, char* name) {
+pika_bool args_getBool(Args* self, char* name) {
     Arg* arg = args_getArg(self, name);
     if (NULL == arg) {
         return _PIKA_BOOL_ERR;
@@ -273,6 +274,9 @@ void* args_getStruct(Args* self, char* name) {
 
 void* args_getHeapStruct(Args* self, char* name) {
     Arg* struct_arg = args_getArg(self, name);
+    if (NULL == struct_arg) {
+        return NULL;
+    }
     return arg_getHeapStruct(struct_arg);
 }
 
@@ -311,7 +315,7 @@ int32_t args_isArgExist(Args* self, char* name) {
     return 0;
 }
 
-PIKA_RES __updateArg(Args* self, Arg* argNew) {
+PIKA_RES _updateArg(Args* self, Arg* argNew) {
     pika_assert(NULL != self);
     pika_assert(NULL != argNew);
     LinkNode* nodeToUpdate = NULL;
@@ -336,12 +340,10 @@ PIKA_RES __updateArg(Args* self, Arg* argNew) {
     }
 
     arg_deinitHeap((Arg*)nodeToUpdate);
-
-    nodeToUpdate = (LinkNode*)arg_setContent(
-        (Arg*)nodeToUpdate, arg_getContent(argNew), arg_getSize(argNew));
-
     pika_assert(NULL != nodeToUpdate);
-    arg_setType((Arg*)nodeToUpdate, arg_getType(argNew));
+
+    nodeToUpdate = (LinkNode*)arg_copy_content((Arg*)nodeToUpdate, argNew);
+
     // update privior link, because arg_getContent would free origin pointer
     if (NULL == priorNode) {
         self->firstNode = nodeToUpdate;
@@ -363,7 +365,7 @@ exit:
 PIKA_RES args_setArg(Args* self, Arg* arg) {
     pika_assert(NULL != self);
     pika_assert(NULL != arg);
-    if (PIKA_RES_OK == __updateArg(self, arg)) {
+    if (PIKA_RES_OK == _updateArg(self, arg)) {
         return PIKA_RES_OK;
     }
     args_pushArg(self, arg);
@@ -442,8 +444,8 @@ Arg* args_getArgByIndex(Args* self, int index) {
 }
 
 PIKA_RES args_foreach(Args* self,
-                      int32_t (*eachHandle)(Arg* argEach, Args* context),
-                      Args* context) {
+                      int32_t (*eachHandle)(Arg* argEach, void* context),
+                      void* context) {
     if (NULL == self->firstNode) {
         return PIKA_RES_OK;
     }
@@ -560,16 +562,26 @@ PIKA_RES pikaList_append(PikaList* self, Arg* arg) {
     return args_setInt(&self->super, "top", top + 1);
 }
 
+Arg* pikaList_pop_withIndex(PikaList* list, int index) {
+    int top = args_getInt(&list->super, "top");
+    if (top <= 0) {
+        return NULL;
+    }
+    if (index < 0) {
+        index = top + index;
+    }
+    Arg* arg = pikaList_getArg(list, index);
+    Arg* res = arg_copy(arg);
+    pikaList_remove(list, arg);
+    return res;
+}
+
 Arg* pikaList_pop(PikaList* list) {
     int top = args_getInt(&list->super, "top");
     if (top <= 0) {
         return NULL;
     }
-    Arg* arg = pikaList_getArg(list, top - 1);
-    Arg* res = arg_copy(arg);
-    args_removeArg(&list->super, arg);
-    args_setInt(&list->super, "top", top - 1);
-    return res;
+    return pikaList_pop_withIndex(list, top - 1);
 }
 
 PIKA_RES pikaList_remove(PikaList* list, Arg* arg) {
@@ -619,7 +631,9 @@ PIKA_RES pikaList_insert(PikaList* self, int index, Arg* arg) {
 }
 
 size_t pikaList_getSize(PikaList* self) {
-    pika_assert(NULL != self);
+    if (NULL == self) {
+        return 0;
+    }
     return args_getInt(&self->super, "top");
 }
 
